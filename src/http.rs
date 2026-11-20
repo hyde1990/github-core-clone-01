@@ -1,14 +1,10 @@
 //! Minimal HTTP/1.1 server: ONE non-blocking epoll reactor thread.
 //!
-//! Round 10 (H10): no thread per connection, no worker pool, no queue, no
-//! dispatch hop. The single reactor thread waits in `epoll_wait`, reads a
-//! ready socket, handles the request inline, and writes the response
-//! inline. With 50 concurrent clones on a 2-CPU pod, thread-per-connection
-//! leaves ~50 threads runnable, and the scheduling delays + allocator
-//! contention inflate the tail that sets the round wall; a single thread
-//! has zero context switches, zero locks, and zero handoffs. Handlers are
-//! microseconds (info/refs ~48 µs, upload-pack ~57 µs), so inline handling
-//! cannot starve the loop.
+//! Round 15: the reactor is unchanged from Round 10 (H10): no thread per
+//! connection, no worker pool, no queue, no dispatch hop. The single
+//! reactor thread waits in `epoll_wait`, reads a ready socket, handles the
+//! request inline, and writes the response inline. Handlers are
+//! microseconds, so inline handling cannot starve the loop.
 //!
 //! epoll itself is reached through raw syscalls (`core::arch::asm!`):
 //! pure-std Rust has no epoll binding and this crate takes no dependencies.

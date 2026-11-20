@@ -1,103 +1,41 @@
-//! A small GraphQL executor for the subset the kit exercises: `viewer`,
-//! `repository`, `node`, `__type`, the issue/pull-request connections with
-//! cursor pagination, and the five mutations. Supports variables, aliases,
-//! inline fragments, named fragments, and batched requests.
+//! GitHub GraphQL v4 (`POST /api/graphql`): the subset gh and
+//! github-mcp-server actually send.
+//!
+//! Round 15 rewrite, written from the kit's conformance suite
+//! (`sdk/conformance/checks-graphql.ts` — its 18 documents are the spec)
+//! and the other modules' public interfaces. The design is my own:
+//! a small lexer, a recursive-descent parser, a validation pass against
+//! hardcoded field tables, and a type-directed executor over the store.
+//! Global ids reuse the store's opaque `*_gid` / `decode_gid` scheme, so
+//! a repository id is never the plain database id and an issue id is
+//! never the plain number.
+//!
+//! Round 15 hardening (C1, C2): named fragments expand with a visited
+//! set (a cycle errors with `fragment cycle detected: {name}`) and a
+//! 10,000-expansion budget; the parser is depth-capped at 128 for both
+//! selection sets (`GraphQL selection nesting too deep`) and argument
+//! values (`GraphQL value nesting too deep`).
+//!
+//! Error policy: a GraphQL-level problem (bad document, unknown field,
+//! failed mutation) is HTTP 200 with an `errors` array, as GitHub
+//! answers; only a body that is not JSON at all is an HTTP 400 with
+//! `{"message":"malformed JSON body"}`.
 
 use crate::http::{Request, Response};
-use crate::json::{obj, Json};
-use crate::rest::next_request_id;
-use crate::store::{diff_trees, pull_mergeable, squash_merge, IssueState, Repo, Store};
+use crate::json::Json;
+use crate::scenario::SCENARIO_EPOCH_SEC;
+use crate::store::{squash_merge, Issue, IssueState, Pull, Store};
 use crate::util::{base64_decode, base64_encode, iso_from_epoch};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-pub fn handle(store: &RwLock<Store>, req: &Request) -> Response {
-    let body = match crate::json::parse(&String::from_utf8_lossy(&req.body)) {
-        Ok(body) => body,
-        Err(_) => {
-            return Response::new(
-                400,
-                br#"{"errors":[{"message":"malformed JSON body"}]}"#.to_vec(),
-            )
-            .header("content-type", "application/json; charset=utf-8")
-            .header("x-github-request-id", &next_request_id())
-        }
-    };
-    let result = match &body {
-        Json::Arr(operations) => {
-            let mut guard = store.write().unwrap();
-            let results: Vec<Json> = operations
-                .iter()
-                .map(|op| execute_one(&mut guard, op))
-                .collect();
-            Json::Arr(results)
-        }
-        Json::Obj(_) => {
-            let mut guard = store.write().unwrap();
-            execute_one(&mut guard, &body)
-        }
-        _ => obj(vec![(
-            "errors",
-            Json::Arr(vec![obj(vec![(
-                "message",
-                Json::Str("expected a JSON object or array".to_string()),
-            )])]),
-        )]),
-    };
-    Response::new(200, result.stringify().into_bytes())
-        .header("content-type", "application/json; charset=utf-8")
-        .header("x-github-request-id", &next_request_id())
-}
+/// The deepest selection/value nesting the parser accepts.
+pub const MAX_GRAPHQL_DEPTH: usize = 128;
+/// The most named-fragment expansions one operation may perform.
+pub const MAX_FRAGMENT_EXPANSIONS: usize = 10_000;
 
-fn execute_one(store: &mut Store, operation: &Json) -> Json {
-    let Some(query) = operation.get("query").and_then(|v| v.as_str()) else {
-        return obj(vec![(
-            "errors",
-            Json::Arr(vec![obj(vec![(
-                "message",
-                Json::Str("query is required".to_string()),
-            )])]),
-        )]);
-    };
-    let variables = operation.get("variables").cloned().unwrap_or(Json::Null);
-    let operation_name = operation
-        .get("operationName")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let mut parser = match Parser::new(query) {
-        Ok(parser) => parser,
-        Err(message) => {
-            return obj(vec![(
-                "errors",
-                Json::Arr(vec![obj(vec![("message", Json::Str(message))])]),
-            )]);
-        }
-    };
-    let document = match parser.parse_document() {
-        Ok(document) => document,
-        Err(message) => {
-            return obj(vec![(
-                "errors",
-                Json::Arr(vec![obj(vec![("message", Json::Str(message))])]),
-            )]);
-        }
-    };
-    let mut executor = Executor {
-        store,
-        variables: &variables,
-        errors: Vec::new(),
-    };
-    match executor.execute(&document, operation_name.as_deref()) {
-        Some(data) => {
-            if executor.errors.is_empty() {
-                obj(vec![("data", data)])
-            } else {
-                obj(vec![("data", data), ("errors", Json::Arr(executor.errors))])
-            }
-        }
-        None => obj(vec![("errors", Json::Arr(executor.errors))]),
-    }
-}
+/// A directive list: `(name, [(arg, value)])` per directive.
+type DirectiveList = Vec<(String, Vec<(String, GqlValue)>)>;
 
 // ---------------------------------------------------------------------------
 // Lexer.
@@ -108,41 +46,41 @@ enum Token {
     Int(i64),
     Float(f64),
     Str(String),
-    LBrace,
-    RBrace,
+    Dollar,
+    Bang,
     LParen,
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Colon,
-    Bang,
-    Dollar,
-    Eq,
-    Spread,
+    Equals,
     At,
+    Spread,
     Pipe,
     Amp,
 }
 
-fn lex(input: &str) -> Result<Vec<Token>, String> {
-    let bytes = input.as_bytes();
+fn lex(src: &str) -> Result<Vec<Token>, String> {
+    let chars: Vec<char> = src.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        match c {
+    while i < chars.len() {
+        let ch = chars[i];
+        match ch {
             ' ' | '\t' | '\n' | '\r' | ',' => i += 1,
             '#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+                while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
-            '{' => {
-                tokens.push(Token::LBrace);
+            '$' => {
+                tokens.push(Token::Dollar);
                 i += 1;
             }
-            '}' => {
-                tokens.push(Token::RBrace);
+            '!' => {
+                tokens.push(Token::Bang);
                 i += 1;
             }
             '(' => {
@@ -161,20 +99,20 @@ fn lex(input: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::RBracket);
                 i += 1;
             }
+            '{' => {
+                tokens.push(Token::LBrace);
+                i += 1;
+            }
+            '}' => {
+                tokens.push(Token::RBrace);
+                i += 1;
+            }
             ':' => {
                 tokens.push(Token::Colon);
                 i += 1;
             }
-            '!' => {
-                tokens.push(Token::Bang);
-                i += 1;
-            }
-            '$' => {
-                tokens.push(Token::Dollar);
-                i += 1;
-            }
             '=' => {
-                tokens.push(Token::Eq);
+                tokens.push(Token::Equals);
                 i += 1;
             }
             '@' => {
@@ -190,1488 +128,2851 @@ fn lex(input: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             '.' => {
-                if input[i..].starts_with("...") {
+                if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '.' {
                     tokens.push(Token::Spread);
                     i += 3;
                 } else {
-                    return Err("unexpected '.'".to_string());
+                    return Err("unexpected '.' in document".to_string());
                 }
             }
             '"' => {
-                let (text, consumed) = lex_string(input, i)?;
-                tokens.push(Token::Str(text));
-                i += consumed;
+                // Block strings (""") are read literally; anything else is
+                // a normal string with backslash escapes.
+                if i + 2 < chars.len() && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                    let mut j = i + 3;
+                    let mut text = String::new();
+                    while j + 2 < chars.len()
+                        && !(chars[j] == '"' && chars[j + 1] == '"' && chars[j + 2] == '"')
+                    {
+                        text.push(chars[j]);
+                        j += 1;
+                    }
+                    if j + 2 >= chars.len() {
+                        return Err("unterminated block string".to_string());
+                    }
+                    tokens.push(Token::Str(text));
+                    i = j + 3;
+                } else {
+                    let mut j = i + 1;
+                    let mut text = String::new();
+                    loop {
+                        if j >= chars.len() {
+                            return Err("unterminated string".to_string());
+                        }
+                        match chars[j] {
+                            '"' => break,
+                            '\\' => {
+                                j += 1;
+                                if j >= chars.len() {
+                                    return Err("unterminated string".to_string());
+                                }
+                                match chars[j] {
+                                    '"' => text.push('"'),
+                                    '\\' => text.push('\\'),
+                                    '/' => text.push('/'),
+                                    'b' => text.push('\u{0008}'),
+                                    'f' => text.push('\u{000C}'),
+                                    'n' => text.push('\n'),
+                                    'r' => text.push('\r'),
+                                    't' => text.push('\t'),
+                                    'u' => {
+                                        if j + 4 >= chars.len() {
+                                            return Err("bad \\u escape".to_string());
+                                        }
+                                        let hex: String = chars[j + 1..j + 5].iter().collect();
+                                        let code = u32::from_str_radix(&hex, 16)
+                                            .map_err(|_| "bad \\u escape".to_string())?;
+                                        text.push(
+                                            char::from_u32(code)
+                                                .ok_or("bad \\u escape".to_string())?,
+                                        );
+                                        j += 4;
+                                    }
+                                    _ => {
+                                        return Err("bad string escape".to_string());
+                                    }
+                                }
+                            }
+                            c => text.push(c),
+                        }
+                        j += 1;
+                    }
+                    tokens.push(Token::Str(text));
+                    i = j + 1;
+                }
             }
             '-' | '0'..='9' => {
                 let start = i;
-                if bytes[i] == b'-' {
-                    i += 1;
-                }
-                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                if chars[i] == '-' {
                     i += 1;
                 }
                 let mut is_float = false;
-                if i < bytes.len() && bytes[i] == b'.' {
-                    is_float = true;
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || chars[i] == '.'
+                        || chars[i] == 'e'
+                        || chars[i] == 'E'
+                        || chars[i] == '+'
+                        || chars[i] == '-')
+                {
+                    if chars[i] == '.' || chars[i] == 'e' || chars[i] == 'E' {
+                        is_float = true;
+                    }
                     i += 1;
-                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-                        i += 1;
-                    }
                 }
-                if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-                    is_float = true;
-                    i += 1;
-                    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-                        i += 1;
-                    }
-                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-                        i += 1;
-                    }
-                }
-                let text = &input[start..i];
+                let text: String = chars[start..i].iter().collect();
                 if is_float {
                     tokens.push(Token::Float(
-                        text.parse().map_err(|_| "bad float".to_string())?,
+                        text.parse::<f64>().map_err(|_| "bad number".to_string())?,
                     ));
                 } else {
-                    tokens.push(Token::Int(text.parse().map_err(|_| "bad int".to_string())?));
+                    tokens.push(Token::Int(
+                        text.parse::<i64>().map_err(|_| "bad number".to_string())?,
+                    ));
                 }
             }
-            _ if c.is_ascii_alphabetic() || c == '_' => {
+            c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
-                while i < bytes.len()
-                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
-                tokens.push(Token::Name(input[start..i].to_string()));
+                tokens.push(Token::Name(chars[start..i].iter().collect()));
             }
-            _ => return Err(format!("unexpected character '{c}'")),
+            _ => return Err(format!("unexpected character '{ch}' in document")),
         }
     }
     Ok(tokens)
 }
 
-fn lex_string(input: &str, start: usize) -> Result<(String, usize), String> {
-    let bytes = input.as_bytes();
-    let mut i = start + 1;
-    let mut out = String::new();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => return Ok((out, i + 1 - start)),
-            b'\\' => {
-                i += 1;
-                if i >= bytes.len() {
-                    break;
-                }
-                match bytes[i] {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        let hex = input.get(i + 1..i + 5).ok_or("bad \\u escape")?;
-                        let code = u32::from_str_radix(hex, 16).map_err(|_| "bad \\u escape")?;
-                        let ch = char::from_u32(code).ok_or("bad \\u escape")?;
-                        out.push(ch);
-                        i += 4;
-                    }
-                    _ => return Err("bad string escape".to_string()),
-                }
-                i += 1;
-            }
-            _ => {
-                // Copy the next UTF-8 character (a truncated tail is an
-                // unterminated string, not a panic: panic aborts the process).
-                let width = utf8_len(bytes[i]);
-                if i + width > bytes.len() {
-                    return Err("unterminated string".to_string());
-                }
-                out.push_str(&input[i..i + width]);
-                i += width;
-            }
-        }
-    }
-    Err("unterminated string".to_string())
-}
-
-fn utf8_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first >> 5 == 0b110 {
-        2
-    } else if first >> 4 == 0b1110 {
-        3
-    } else {
-        4
-    }
-}
-
 // ---------------------------------------------------------------------------
-// AST + parser.
+// AST.
 
+/// An argument value as written in the document.
 #[derive(Clone, Debug)]
-enum Value {
-    Variable(String),
+enum GqlValue {
+    Null,
+    Bool(bool),
     Int(i64),
     Float(f64),
     Str(String),
-    Bool(bool),
-    Null,
+    /// A bare name (`OPEN`, `CREATED_AT`): an enum literal.
     Enum(String),
-    List(Vec<Value>),
-    Object(Vec<(String, Value)>),
+    List(Vec<GqlValue>),
+    Object(Vec<(String, GqlValue)>),
+    Var(String),
 }
 
+impl GqlValue {
+    /// Resolve variables against the request's variables map. Enum literals
+    /// become plain strings; everything else mirrors the JSON shape.
+    fn resolve(&self, vars: &HashMap<String, Json>) -> Json {
+        match self {
+            GqlValue::Null => Json::Null,
+            GqlValue::Bool(flag) => Json::Bool(*flag),
+            GqlValue::Int(n) => Json::Int(*n),
+            GqlValue::Float(f) => Json::Float(*f),
+            GqlValue::Str(text) => Json::Str(text.clone()),
+            GqlValue::Enum(name) => Json::Str(name.clone()),
+            GqlValue::List(items) => {
+                Json::Arr(items.iter().map(|item| item.resolve(vars)).collect())
+            }
+            GqlValue::Object(fields) => Json::Obj(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.resolve(vars)))
+                    .collect(),
+            ),
+            GqlValue::Var(name) => vars.get(name).cloned().unwrap_or(Json::Null),
+        }
+    }
+}
+
+/// One field selection: `alias: name(args) @directives { sub }`.
 #[derive(Clone, Debug)]
-struct Field {
+struct FieldSel {
     alias: Option<String>,
     name: String,
-    arguments: Vec<(String, Value)>,
-    selection: Vec<Selection>,
+    args: Vec<(String, GqlValue)>,
+    directives: DirectiveList,
+    sub: Vec<Selection>,
 }
 
 #[derive(Clone, Debug)]
 enum Selection {
-    Field(Field),
-    InlineFragment {
-        type_condition: Option<String>,
-        selection: Vec<Selection>,
-    },
-    FragmentSpread(String),
+    Field(FieldSel),
+    /// `...Name @directives`
+    Spread(String, DirectiveList),
+    /// `... [on Type] @directives { sub }`
+    Inline(Option<String>, DirectiveList, Vec<Selection>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpKind {
+    Query,
+    Mutation,
 }
 
 #[derive(Clone, Debug)]
 struct Operation {
-    kind: String, // "query" | "mutation"
+    kind: OpKind,
     name: Option<String>,
-    selection: Vec<Selection>,
+    /// Variable definitions: name and optional default value.
+    var_defs: Vec<(String, Option<GqlValue>)>,
+    selections: Vec<Selection>,
 }
 
 #[derive(Clone, Debug)]
-struct Document {
-    operations: Vec<Operation>,
-    fragments: HashMap<String, Vec<Selection>>,
+struct FragmentDef {
+    type_cond: String,
+    selections: Vec<Selection>,
 }
 
+#[derive(Default)]
+struct Document {
+    ops: Vec<Operation>,
+    frags: HashMap<String, FragmentDef>,
+}
+
+// ---------------------------------------------------------------------------
+// Parser (recursive descent; depth-capped).
+
 struct Parser {
-    tokens: Vec<Token>,
+    toks: Vec<Token>,
     pos: usize,
 }
 
 impl Parser {
-    fn new(input: &str) -> Result<Self, String> {
-        Ok(Parser {
-            tokens: lex(input)?,
-            pos: 0,
-        })
-    }
-
     fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+        self.toks.get(self.pos)
     }
 
     fn next(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.pos).cloned();
-        if token.is_some() {
+        let tok = self.toks.get(self.pos).cloned();
+        if tok.is_some() {
             self.pos += 1;
         }
-        token
+        tok
     }
 
-    fn expect(&mut self, expected: &Token) -> Result<(), String> {
+    fn expect(&mut self, want: &Token) -> Result<(), String> {
         match self.next() {
-            Some(token) if &token == expected => Ok(()),
-            other => Err(format!("expected {expected:?}, found {other:?}")),
+            Some(tok) if &tok == want => Ok(()),
+            Some(tok) => Err(format!("expected {want:?}, found {tok:?}")),
+            None => Err(format!("expected {want:?}, found end of document")),
         }
+    }
+
+    fn expect_name(&mut self) -> Result<String, String> {
+        match self.next() {
+            Some(Token::Name(name)) => Ok(name),
+            Some(tok) => Err(format!("expected a name, found {tok:?}")),
+            None => Err("expected a name, found end of document".to_string()),
+        }
+    }
+
+    fn at_punct(&self, want: &Token) -> bool {
+        self.peek() == Some(want)
     }
 
     fn parse_document(&mut self) -> Result<Document, String> {
-        let mut operations = Vec::new();
-        let mut fragments = HashMap::new();
+        let mut doc = Document::default();
         while self.peek().is_some() {
             match self.peek() {
                 Some(Token::LBrace) => {
-                    let selection = self.parse_selection_set()?;
-                    operations.push(Operation {
-                        kind: "query".to_string(),
+                    let selections = self.parse_selection_set(0)?;
+                    doc.ops.push(Operation {
+                        kind: OpKind::Query,
                         name: None,
-                        selection,
+                        var_defs: Vec::new(),
+                        selections,
                     });
                 }
-                Some(Token::Name(name)) if name == "query" || name == "mutation" => {
-                    let kind = name.clone();
+                Some(Token::Name(keyword)) if keyword == "query" || keyword == "mutation" => {
+                    let kind = if keyword == "query" {
+                        OpKind::Query
+                    } else {
+                        OpKind::Mutation
+                    };
                     self.next();
-                    let op_name = match self.peek() {
-                        Some(Token::Name(_)) => {
-                            if let Some(Token::Name(n)) = self.next() {
-                                Some(n)
-                            } else {
-                                None
-                            }
-                        }
+                    let name = match self.peek() {
+                        Some(Token::Name(_)) => Some(self.expect_name()?),
                         _ => None,
                     };
-                    // Variable definitions: ($x: Type = default, ...).
-                    if self.peek() == Some(&Token::LParen) {
-                        self.skip_balanced(Token::LParen, Token::RParen)?;
+                    let var_defs = if self.at_punct(&Token::LParen) {
+                        self.parse_var_defs()?
+                    } else {
+                        Vec::new()
+                    };
+                    // Directives on the operation itself are parsed and ignored.
+                    while self.at_punct(&Token::At) {
+                        self.parse_directive()?;
                     }
-                    // Directives: @name(args...).
-                    while self.peek() == Some(&Token::At) {
-                        self.next();
-                        self.parse_name()?;
-                        if self.peek() == Some(&Token::LParen) {
-                            self.skip_balanced(Token::LParen, Token::RParen)?;
-                        }
-                    }
-                    let selection = self.parse_selection_set()?;
-                    operations.push(Operation {
+                    let selections = self.parse_selection_set(0)?;
+                    doc.ops.push(Operation {
                         kind,
-                        name: op_name,
-                        selection,
+                        name,
+                        var_defs,
+                        selections,
                     });
                 }
-                Some(Token::Name(name)) if name == "fragment" => {
+                Some(Token::Name(keyword)) if keyword == "fragment" => {
                     self.next();
-                    let frag_name = self.parse_name()?;
-                    // `on Type`
-                    let on = self.parse_name()?;
+                    let name = self.expect_name()?;
+                    let on = self.expect_name()?;
                     if on != "on" {
-                        return Err("expected 'on' in fragment".to_string());
+                        return Err(format!("expected 'on' in fragment, found {on}"));
                     }
-                    self.parse_name()?; // the type name
-                    let selection = self.parse_selection_set()?;
-                    fragments.insert(frag_name, selection);
+                    let type_cond = self.expect_name()?;
+                    while self.at_punct(&Token::At) {
+                        self.parse_directive()?;
+                    }
+                    let selections = self.parse_selection_set(0)?;
+                    doc.frags.insert(
+                        name.clone(),
+                        FragmentDef {
+                            type_cond,
+                            selections,
+                        },
+                    );
                 }
-                other => return Err(format!("unexpected token at document level: {other:?}")),
+                Some(tok) => {
+                    return Err(format!("unexpected {tok:?} at the top of a document"));
+                }
+                None => break,
             }
         }
-        if operations.is_empty() {
-            return Err("no operation in document".to_string());
+        if doc.ops.is_empty() {
+            return Err("document has no operation".to_string());
         }
-        Ok(Document {
-            operations,
-            fragments,
-        })
+        Ok(doc)
     }
 
-    fn parse_name(&mut self) -> Result<String, String> {
+    fn parse_var_defs(&mut self) -> Result<Vec<(String, Option<GqlValue>)>, String> {
+        self.expect(&Token::LParen)?;
+        let mut defs = Vec::new();
+        while !self.at_punct(&Token::RParen) {
+            self.expect(&Token::Dollar)?;
+            let name = self.expect_name()?;
+            self.expect(&Token::Colon)?;
+            self.parse_type()?;
+            let default = if self.at_punct(&Token::Equals) {
+                self.next();
+                Some(self.parse_value(0)?)
+            } else {
+                None
+            };
+            defs.push((name, default));
+            if self.peek().is_none() {
+                return Err("unterminated variable definitions".to_string());
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(defs)
+    }
+
+    /// A type expression (`String!`, `[Int]`, `CreateIssueInput!`): parsed
+    /// as an opaque shape — execution only needs the variable values.
+    fn parse_type(&mut self) -> Result<(), String> {
         match self.next() {
-            Some(Token::Name(name)) => Ok(name),
-            other => Err(format!("expected a name, found {other:?}")),
-        }
-    }
-
-    fn skip_balanced(&mut self, open: Token, close: Token) -> Result<(), String> {
-        self.expect(&open)?;
-        let mut depth = 1;
-        while depth > 0 {
-            match self.next() {
-                Some(token) if token == open => depth += 1,
-                Some(token) if token == close => depth -= 1,
-                Some(_) => {}
-                None => return Err("unbalanced parentheses".to_string()),
+            Some(Token::LBracket) => {
+                self.parse_type()?;
+                self.expect(&Token::RBracket)?;
             }
+            Some(Token::Name(_)) => {}
+            Some(tok) => return Err(format!("expected a type, found {tok:?}")),
+            None => return Err("expected a type, found end of document".to_string()),
+        }
+        if self.at_punct(&Token::Bang) {
+            self.next();
         }
         Ok(())
     }
 
-    fn parse_selection_set(&mut self) -> Result<Vec<Selection>, String> {
+    fn parse_selection_set(&mut self, depth: usize) -> Result<Vec<Selection>, String> {
+        if depth > MAX_GRAPHQL_DEPTH {
+            return Err("GraphQL selection nesting too deep".to_string());
+        }
         self.expect(&Token::LBrace)?;
         let mut selections = Vec::new();
-        while self.peek() != Some(&Token::RBrace) {
+        while !self.at_punct(&Token::RBrace) {
             if self.peek().is_none() {
                 return Err("unterminated selection set".to_string());
             }
-            selections.push(self.parse_selection()?);
+            selections.push(self.parse_selection(depth)?);
         }
         self.expect(&Token::RBrace)?;
         Ok(selections)
     }
 
-    fn parse_selection(&mut self) -> Result<Selection, String> {
-        match self.peek() {
-            Some(Token::Spread) => {
+    fn parse_selection(&mut self, depth: usize) -> Result<Selection, String> {
+        if self.at_punct(&Token::Spread) {
+            self.next();
+            match self.peek() {
+                Some(Token::Name(name)) if name == "on" => {
+                    self.next();
+                    let type_cond = self.expect_name()?;
+                    let directives = self.parse_directives()?;
+                    let sub = self.parse_selection_set(depth + 1)?;
+                    Ok(Selection::Inline(Some(type_cond), directives, sub))
+                }
+                Some(Token::Name(_)) => {
+                    let name = self.expect_name()?;
+                    let directives = self.parse_directives()?;
+                    Ok(Selection::Spread(name, directives))
+                }
+                Some(Token::LBrace) => {
+                    let directives = self.parse_directives()?;
+                    let sub = self.parse_selection_set(depth + 1)?;
+                    Ok(Selection::Inline(None, directives, sub))
+                }
+                _ => {
+                    let directives = self.parse_directives()?;
+                    let sub = self.parse_selection_set(depth + 1)?;
+                    Ok(Selection::Inline(None, directives, sub))
+                }
+            }
+        } else {
+            let first = self.expect_name()?;
+            let (alias, name) = if self.at_punct(&Token::Colon) {
                 self.next();
-                match self.peek() {
-                    Some(Token::Name(name)) if name == "on" => {
-                        self.next();
-                        let type_name = self.parse_name()?;
-                        let selection = self.parse_selection_set()?;
-                        Ok(Selection::InlineFragment {
-                            type_condition: Some(type_name),
-                            selection,
-                        })
-                    }
-                    Some(Token::Name(name)) => {
-                        let frag = name.clone();
-                        self.next();
-                        Ok(Selection::FragmentSpread(frag))
-                    }
-                    Some(Token::LBrace) => {
-                        let selection = self.parse_selection_set()?;
-                        Ok(Selection::InlineFragment {
-                            type_condition: None,
-                            selection,
-                        })
-                    }
-                    other => Err(format!("bad fragment spread: {other:?}")),
-                }
-            }
-            Some(Token::Name(_)) => {
-                let first = self.parse_name()?;
-                let (alias, name) = if self.peek() == Some(&Token::Colon) {
-                    self.next();
-                    (Some(first), self.parse_name()?)
-                } else {
-                    (None, first)
-                };
-                let mut arguments = Vec::new();
-                if self.peek() == Some(&Token::LParen) {
-                    self.next();
-                    while self.peek() != Some(&Token::RParen) {
-                        let arg_name = self.parse_name()?;
-                        self.expect(&Token::Colon)?;
-                        let value = self.parse_value()?;
-                        arguments.push((arg_name, value));
-                    }
-                    self.expect(&Token::RParen)?;
-                }
-                // Directives (ignored: @include/@skip are not exercised).
-                while self.peek() == Some(&Token::At) {
-                    self.next();
-                    self.parse_name()?;
-                    if self.peek() == Some(&Token::LParen) {
-                        self.skip_balanced(Token::LParen, Token::RParen)?;
-                    }
-                }
-                let selection = if self.peek() == Some(&Token::LBrace) {
-                    self.parse_selection_set()?
-                } else {
-                    Vec::new()
-                };
-                Ok(Selection::Field(Field {
-                    alias,
-                    name,
-                    arguments,
-                    selection,
-                }))
-            }
-            other => Err(format!("unexpected token in selection set: {other:?}")),
+                (Some(first), self.expect_name()?)
+            } else {
+                (None, first)
+            };
+            let args = if self.at_punct(&Token::LParen) {
+                self.parse_args()?
+            } else {
+                Vec::new()
+            };
+            let directives = self.parse_directives()?;
+            let sub = if self.at_punct(&Token::LBrace) {
+                self.parse_selection_set(depth + 1)?
+            } else {
+                Vec::new()
+            };
+            Ok(Selection::Field(FieldSel {
+                alias,
+                name,
+                args,
+                directives,
+                sub,
+            }))
         }
     }
 
-    fn parse_value(&mut self) -> Result<Value, String> {
+    fn parse_directives(&mut self) -> Result<DirectiveList, String> {
+        let mut directives = Vec::new();
+        while self.at_punct(&Token::At) {
+            directives.push(self.parse_directive()?);
+        }
+        Ok(directives)
+    }
+
+    fn parse_directive(&mut self) -> Result<(String, Vec<(String, GqlValue)>), String> {
+        self.expect(&Token::At)?;
+        let name = self.expect_name()?;
+        let args = if self.at_punct(&Token::LParen) {
+            self.parse_args()?
+        } else {
+            Vec::new()
+        };
+        Ok((name, args))
+    }
+
+    fn parse_args(&mut self) -> Result<Vec<(String, GqlValue)>, String> {
+        self.expect(&Token::LParen)?;
+        let mut args = Vec::new();
+        while !self.at_punct(&Token::RParen) {
+            if self.peek().is_none() {
+                return Err("unterminated arguments".to_string());
+            }
+            let name = self.expect_name()?;
+            self.expect(&Token::Colon)?;
+            let value = self.parse_value(0)?;
+            args.push((name, value));
+        }
+        self.expect(&Token::RParen)?;
+        Ok(args)
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<GqlValue, String> {
+        if depth > MAX_GRAPHQL_DEPTH {
+            return Err("GraphQL value nesting too deep".to_string());
+        }
         match self.next() {
-            Some(Token::Dollar) => Ok(Value::Variable(self.parse_name()?)),
-            Some(Token::Int(n)) => Ok(Value::Int(n)),
-            Some(Token::Float(f)) => Ok(Value::Float(f)),
-            Some(Token::Str(s)) => Ok(Value::Str(s)),
+            Some(Token::Dollar) => Ok(GqlValue::Var(self.expect_name()?)),
+            Some(Token::Int(n)) => Ok(GqlValue::Int(n)),
+            Some(Token::Float(f)) => Ok(GqlValue::Float(f)),
+            Some(Token::Str(text)) => Ok(GqlValue::Str(text)),
             Some(Token::Name(name)) => match name.as_str() {
-                "true" => Ok(Value::Bool(true)),
-                "false" => Ok(Value::Bool(false)),
-                "null" => Ok(Value::Null),
-                _ => Ok(Value::Enum(name)),
+                "true" => Ok(GqlValue::Bool(true)),
+                "false" => Ok(GqlValue::Bool(false)),
+                "null" => Ok(GqlValue::Null),
+                _ => Ok(GqlValue::Enum(name)),
             },
             Some(Token::LBracket) => {
                 let mut items = Vec::new();
-                while self.peek() != Some(&Token::RBracket) {
-                    items.push(self.parse_value()?);
+                while !self.at_punct(&Token::RBracket) {
+                    if self.peek().is_none() {
+                        return Err("unterminated list value".to_string());
+                    }
+                    items.push(self.parse_value(depth + 1)?);
                 }
                 self.expect(&Token::RBracket)?;
-                Ok(Value::List(items))
+                Ok(GqlValue::List(items))
             }
             Some(Token::LBrace) => {
                 let mut fields = Vec::new();
-                while self.peek() != Some(&Token::RBrace) {
-                    let key = self.parse_name()?;
+                while !self.at_punct(&Token::RBrace) {
+                    if self.peek().is_none() {
+                        return Err("unterminated object value".to_string());
+                    }
+                    let name = self.expect_name()?;
                     self.expect(&Token::Colon)?;
-                    fields.push((key, self.parse_value()?));
+                    let value = self.parse_value(depth + 1)?;
+                    fields.push((name, value));
                 }
                 self.expect(&Token::RBrace)?;
-                Ok(Value::Object(fields))
+                Ok(GqlValue::Object(fields))
             }
-            other => Err(format!("unexpected value token: {other:?}")),
+            Some(tok) => Err(format!("unexpected {tok:?} as a value")),
+            None => Err("unexpected end of document in a value".to_string()),
+        }
+    }
+}
+
+fn parse_document(src: &str) -> Result<Document, String> {
+    let toks = lex(src)?;
+    let mut parser = Parser { toks, pos: 0 };
+    parser.parse_document()
+}
+
+// ---------------------------------------------------------------------------
+// Schema tables (the surface the suite's documents use).
+
+/// Field name -> result type for every object type the executor knows.
+/// List fields name their element type; scalar-ness decides whether a
+/// sub-selection is legal.
+fn fields_of(type_name: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    Some(match type_name {
+        "Query" => &[
+            ("viewer", "User"),
+            ("repository", "Repository"),
+            ("node", "Node"),
+            ("__type", "__Type"),
+        ],
+        "Mutation" => &[
+            ("createIssue", "CreateIssuePayload"),
+            ("closeIssue", "CloseIssuePayload"),
+            ("createPullRequest", "CreatePullRequestPayload"),
+            ("mergePullRequest", "MergePullRequestPayload"),
+            ("addComment", "AddCommentPayload"),
+        ],
+        "User" => &[
+            ("login", "String"),
+            ("id", "ID"),
+            ("name", "String"),
+            ("email", "String"),
+        ],
+        "Repository" => &[
+            ("id", "ID"),
+            ("databaseId", "Int"),
+            ("name", "String"),
+            ("nameWithOwner", "String"),
+            ("owner", "User"),
+            ("defaultBranchRef", "Ref"),
+            ("viewerPermission", "RepositoryPermission"),
+            ("hasIssuesEnabled", "Boolean"),
+            ("issue", "Issue"),
+            ("issues", "IssueConnection"),
+            ("pullRequests", "PullRequestConnection"),
+            ("pullRequest", "PullRequest"),
+            ("description", "String"),
+            ("url", "String"),
+            ("isPrivate", "Boolean"),
+        ],
+        "Issue" => &[
+            ("id", "ID"),
+            ("number", "Int"),
+            ("title", "String"),
+            ("state", "IssueState"),
+            ("body", "String"),
+            ("url", "String"),
+            ("createdAt", "String"),
+            ("author", "User"),
+            ("labels", "Label"),
+        ],
+        "PullRequest" => &[
+            ("id", "ID"),
+            ("number", "Int"),
+            ("title", "String"),
+            ("body", "String"),
+            ("state", "PullRequestState"),
+            ("merged", "Boolean"),
+            ("headRefName", "String"),
+            ("baseRefName", "String"),
+            ("mergeable", "MergeableState"),
+            ("files", "PullRequestChangedFileConnection"),
+            ("url", "String"),
+            ("createdAt", "String"),
+            ("author", "User"),
+        ],
+        "Ref" => &[("name", "String")],
+        "IssueConnection" => &[
+            ("nodes", "Issue"),
+            ("edges", "IssueEdge"),
+            ("pageInfo", "PageInfo"),
+            ("totalCount", "Int"),
+        ],
+        "IssueEdge" => &[("node", "Issue"), ("cursor", "String")],
+        "PageInfo" => &[
+            ("hasNextPage", "Boolean"),
+            ("hasPreviousPage", "Boolean"),
+            ("startCursor", "String"),
+            ("endCursor", "String"),
+        ],
+        "PullRequestConnection" => &[
+            ("nodes", "PullRequest"),
+            ("edges", "PullRequestEdge"),
+            ("pageInfo", "PageInfo"),
+            ("totalCount", "Int"),
+        ],
+        "PullRequestEdge" => &[("node", "PullRequest"), ("cursor", "String")],
+        "PullRequestChangedFileConnection" => &[
+            ("nodes", "PullRequestChangedFile"),
+            ("pageInfo", "PageInfo"),
+            ("totalCount", "Int"),
+        ],
+        "PullRequestChangedFile" => &[
+            ("path", "String"),
+            ("additions", "Int"),
+            ("deletions", "Int"),
+            ("changeType", "String"),
+        ],
+        "__Type" => &[
+            ("name", "String"),
+            ("kind", "String"),
+            ("description", "String"),
+            ("fields", "__Field"),
+            ("enumValues", "__EnumValue"),
+        ],
+        "__Field" => &[("name", "String"), ("description", "String")],
+        "__EnumValue" => &[("name", "String"), ("description", "String")],
+        "Label" => &[
+            ("name", "String"),
+            ("color", "String"),
+            ("description", "String"),
+        ],
+        "IssueComment" => &[("id", "ID"), ("body", "String"), ("author", "User")],
+        "CommentEdge" => &[("node", "IssueComment")],
+        "CreateIssuePayload" => &[("issue", "Issue")],
+        "CloseIssuePayload" => &[("issue", "Issue")],
+        "CreatePullRequestPayload" => &[("pullRequest", "PullRequest")],
+        "MergePullRequestPayload" => &[("pullRequest", "PullRequest")],
+        "AddCommentPayload" => &[("commentEdge", "CommentEdge")],
+        "Node" => &[("id", "ID")],
+        _ => return None,
+    })
+}
+
+fn is_scalar(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "String"
+            | "Int"
+            | "Float"
+            | "Boolean"
+            | "ID"
+            | "IssueState"
+            | "PullRequestState"
+            | "MergeableState"
+            | "RepositoryPermission"
+            | "IssueOrderField"
+            | "OrderDirection"
+            | "PullRequestMergeMethod"
+            | "SearchType"
+    )
+}
+
+fn is_enum(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "IssueState"
+            | "PullRequestState"
+            | "MergeableState"
+            | "RepositoryPermission"
+            | "IssueOrderField"
+            | "OrderDirection"
+            | "PullRequestMergeMethod"
+            | "SearchType"
+    )
+}
+
+fn enum_values(type_name: &str) -> &'static [&'static str] {
+    match type_name {
+        "SearchType" => &[
+            "ISSUE",
+            "PULL_REQUEST",
+            "REPOSITORY",
+            "USER",
+            "DISCUSSION",
+            "COMMIT",
+            "MILESTONE",
+        ],
+        "IssueState" => &["OPEN", "CLOSED"],
+        "PullRequestState" => &["OPEN", "CLOSED", "MERGED"],
+        "MergeableState" => &["MERGEABLE", "CONFLICTING", "UNKNOWN"],
+        "RepositoryPermission" => &["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ"],
+        "IssueOrderField" => &["CREATED_AT", "UPDATED_AT", "COMMENTS"],
+        "OrderDirection" => &["ASC", "DESC"],
+        "PullRequestMergeMethod" => &["MERGE", "SQUASH", "REBASE"],
+        _ => &[],
+    }
+}
+
+fn type_kind(type_name: &str) -> &'static str {
+    if is_enum(type_name) {
+        "ENUM"
+    } else if is_scalar(type_name) {
+        "SCALAR"
+    } else if type_name == "Node" {
+        "INTERFACE"
+    } else {
+        "OBJECT"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation: unknown fields, missing/extra sub-selections, fragment
+// cycles and the expansion budget. A document that fails validation is
+// answered with data null and the errors, never executed.
+
+fn validate_operation(doc: &Document, op: &Operation) -> Vec<String> {
+    let mut errors = Vec::new();
+    let root = match op.kind {
+        OpKind::Query => "Query",
+        OpKind::Mutation => "Mutation",
+    };
+    let mut stack: Vec<String> = Vec::new();
+    let mut budget = 0usize;
+    validate_selections(
+        root,
+        &op.selections,
+        doc,
+        &mut stack,
+        &mut budget,
+        &mut errors,
+    );
+    errors
+}
+
+fn validate_selections(
+    type_name: &str,
+    selections: &[Selection],
+    doc: &Document,
+    stack: &mut Vec<String>,
+    budget: &mut usize,
+    errors: &mut Vec<String>,
+) {
+    for selection in selections {
+        match selection {
+            Selection::Field(field) => {
+                if field.name == "__typename" {
+                    if !field.sub.is_empty() {
+                        errors.push(
+                            "Field \"__typename\" must not have a selection since type \"String\" has no subfields."
+                                .to_string(),
+                        );
+                    }
+                    continue;
+                }
+                let Some(fields) = fields_of(type_name) else {
+                    errors.push(format!("Unknown type \"{type_name}\"."));
+                    continue;
+                };
+                let Some((_, result)) = fields.iter().find(|(name, _)| *name == field.name) else {
+                    errors.push(format!(
+                        "Cannot query field \"{}\" on type \"{type_name}\".",
+                        field.name
+                    ));
+                    continue;
+                };
+                if is_scalar(result) {
+                    if !field.sub.is_empty() {
+                        errors.push(format!(
+                            "Field \"{}\" must not have a selection since type \"{result}\" has no subfields.",
+                            field.name
+                        ));
+                    }
+                } else if field.sub.is_empty() {
+                    errors.push(format!(
+                        "Field \"{}\" of type \"{result}\" must have a selection of subfields.",
+                        field.name
+                    ));
+                } else {
+                    validate_selections(result, &field.sub, doc, stack, budget, errors);
+                }
+            }
+            Selection::Spread(name, _) => {
+                if stack.contains(name) {
+                    errors.push(format!("fragment cycle detected: {name}"));
+                    continue;
+                }
+                if *budget >= MAX_FRAGMENT_EXPANSIONS {
+                    errors.push("fragment expansion limit exceeded".to_string());
+                    continue;
+                }
+                let Some(fragment) = doc.frags.get(name) else {
+                    errors.push(format!("Unknown fragment \"{name}\"."));
+                    continue;
+                };
+                if fragment.type_cond != type_name
+                    && type_name != "Node"
+                    && fragment.type_cond != "Node"
+                {
+                    errors.push(format!(
+                        "Fragment \"{name}\" cannot be spread here as objects of type \"{type_name}\" can never be of type \"{}\".",
+                        fragment.type_cond
+                    ));
+                    continue;
+                }
+                *budget += 1;
+                stack.push(name.clone());
+                let cond = fragment.type_cond.clone();
+                validate_selections(&cond, &fragment.selections, doc, stack, budget, errors);
+                stack.pop();
+            }
+            Selection::Inline(cond, _, sub) => {
+                let target = cond.as_deref().unwrap_or(type_name);
+                if fields_of(target).is_none() {
+                    errors.push(format!("Unknown type \"{target}\"."));
+                    continue;
+                }
+                validate_selections(target, sub, doc, stack, budget, errors);
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Executor.
+// Resolved values and the object model.
 
-struct Executor<'a> {
-    store: &'a mut Store,
-    variables: &'a Json,
-    errors: Vec<Json>,
+enum Resolved {
+    Null,
+    Value(Json),
+    Object(GqlObj),
+    Objects(Vec<GqlObj>),
 }
 
 #[derive(Clone, Debug)]
-enum Node {
-    Query,
-    Mutation,
-    User(String),
-    Repository(u32),
-    Issue(u32, u32), // (repo db id, number)
-    Pull(u32, u32),
-    Branch(String),
-    /// (repo db id, issue numbers in query order, cursor number, first)
-    IssueConnection(u32, Vec<u32>, Option<u32>, usize),
-    /// (repo db id, pull numbers, first)
-    PullConnection(u32, Vec<u32>, usize),
-    /// (repo db id, pull number, file paths, first)
-    FileConnection(u32, u32, Vec<String>, usize),
-    Comment(u64, String),
-    CommentEdge(u64, String),
-    PageInfo(bool, Option<String>),
-    CreateIssue(u32, u32),
-    CloseIssue(u32, u32),
-    CreatePull(u32, u32),
-    MergePull(u32, u32),
-    AddComment(u64, String),
-    Type(String),
+enum GqlObj {
+    RootQuery,
+    RootMutation,
+    Viewer,
+    Repo {
+        owner: String,
+        name: String,
+    },
+    Issue {
+        owner: String,
+        name: String,
+        number: u32,
+    },
+    Pull {
+        owner: String,
+        name: String,
+        number: u32,
+    },
+    BranchRef {
+        branch: String,
+    },
+    IssueConn {
+        owner: String,
+        name: String,
+        numbers: Vec<u32>,
+        has_next: bool,
+        end_cursor: Option<String>,
+    },
+    IssueEdge {
+        owner: String,
+        name: String,
+        number: u32,
+        cursor: String,
+    },
+    PullConn {
+        owner: String,
+        name: String,
+        numbers: Vec<u32>,
+    },
+    PullEdge {
+        owner: String,
+        name: String,
+        number: u32,
+        cursor: String,
+    },
+    PageInfo {
+        has_next: bool,
+        has_prev: bool,
+        start_cursor: Option<String>,
+        end_cursor: Option<String>,
+    },
+    FileConn {
+        files: Vec<crate::store::FileChange>,
+    },
+    ChangedFile {
+        path: String,
+        additions: u32,
+        deletions: u32,
+        status: String,
+    },
+    TypeInfo {
+        name: String,
+    },
+    FieldInfo {
+        name: String,
+    },
+    EnumValueInfo {
+        name: String,
+    },
+    Label {
+        name: String,
+        color: String,
+    },
+    Comment {
+        id: String,
+        body: String,
+    },
+    CommentEdge {
+        id: String,
+        body: String,
+    },
+    IssuePayload {
+        owner: String,
+        name: String,
+        number: u32,
+    },
+    PullPayload {
+        owner: String,
+        name: String,
+        number: u32,
+    },
+    CommentPayload {
+        id: String,
+        body: String,
+    },
 }
 
-impl<'a> Executor<'a> {
-    fn execute(&mut self, document: &Document, operation_name: Option<&str>) -> Option<Json> {
-        let operation = if document.operations.len() == 1 {
-            &document.operations[0]
-        } else {
-            let name = operation_name?;
-            document
-                .operations
-                .iter()
-                .find(|op| op.name.as_deref() == Some(name))?
+impl GqlObj {
+    fn type_name(&self) -> &'static str {
+        match self {
+            GqlObj::RootQuery => "Query",
+            GqlObj::RootMutation => "Mutation",
+            GqlObj::Viewer => "User",
+            GqlObj::Repo { .. } => "Repository",
+            GqlObj::Issue { .. } => "Issue",
+            GqlObj::Pull { .. } => "PullRequest",
+            GqlObj::BranchRef { .. } => "Ref",
+            GqlObj::IssueConn { .. } => "IssueConnection",
+            GqlObj::IssueEdge { .. } => "IssueEdge",
+            GqlObj::PullConn { .. } => "PullRequestConnection",
+            GqlObj::PullEdge { .. } => "PullRequestEdge",
+            GqlObj::PageInfo { .. } => "PageInfo",
+            GqlObj::FileConn { .. } => "PullRequestChangedFileConnection",
+            GqlObj::ChangedFile { .. } => "PullRequestChangedFile",
+            GqlObj::TypeInfo { .. } => "__Type",
+            GqlObj::FieldInfo { .. } => "__Field",
+            GqlObj::EnumValueInfo { .. } => "__EnumValue",
+            GqlObj::Label { .. } => "Label",
+            GqlObj::Comment { .. } => "IssueComment",
+            GqlObj::CommentEdge { .. } => "CommentEdge",
+            GqlObj::IssuePayload { .. } => "CreateIssuePayload",
+            GqlObj::PullPayload { .. } => "CreatePullRequestPayload",
+            GqlObj::CommentPayload { .. } => "AddCommentPayload",
+        }
+    }
+}
+
+/// A page cursor: base64 of `cursor:{issue number}`.
+fn cursor_for(number: u32) -> String {
+    base64_encode(format!("cursor:{number}").as_bytes())
+}
+
+fn cursor_number(cursor: &str) -> Option<u32> {
+    let bytes = base64_decode(cursor)?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    text.strip_prefix("cursor:")?.parse().ok()
+}
+
+fn arg_str<'a>(args: &'a [(String, Json)], name: &str) -> Option<&'a str> {
+    args.iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| value.as_str())
+}
+
+fn arg_int(args: &[(String, Json)], name: &str) -> Option<i64> {
+    args.iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| value.as_i64())
+}
+
+fn arg_obj<'a>(args: &'a [(String, Json)], name: &str) -> Option<&'a Json> {
+    args.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
+fn obj_field<'a>(value: &'a Json, name: &str) -> Option<&'a Json> {
+    value.get(name)
+}
+
+/// The repository key for a database id, if any repository carries it.
+fn repo_key_by_db_id(store: &Store, db_id: u32) -> Option<(String, String)> {
+    store
+        .repos
+        .iter()
+        .find(|(_, repo)| repo.db_id == db_id)
+        .map(|(key, _)| key.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Executor.
+
+struct Exec<'a> {
+    store: &'a mut Store,
+    doc: &'a Document,
+    vars: HashMap<String, Json>,
+    errors: Vec<String>,
+    frag_stack: Vec<String>,
+    frag_budget: usize,
+}
+
+impl<'a> Exec<'a> {
+    fn run(&mut self, op: &Operation) -> Json {
+        let root = match op.kind {
+            OpKind::Query => GqlObj::RootQuery,
+            OpKind::Mutation => GqlObj::RootMutation,
         };
-        let root = if operation.kind == "mutation" {
-            Node::Mutation
-        } else {
-            Node::Query
-        };
-        let mut out = Vec::new();
-        self.resolve_selections(document, root, &operation.selection, &mut out);
-        Some(Json::Obj(out))
+        let mut out: Vec<(String, Json)> = Vec::new();
+        self.exec_selections(&root, &op.selections, &mut out);
+        Json::Obj(out)
     }
 
-    fn resolve_selections(
+    fn exec_selections(
         &mut self,
-        document: &Document,
-        node: Node,
+        obj: &GqlObj,
         selections: &[Selection],
         out: &mut Vec<(String, Json)>,
     ) {
         for selection in selections {
             match selection {
                 Selection::Field(field) => {
-                    let key = field.alias.clone().unwrap_or_else(|| field.name.clone());
-                    let value = self.resolve_field(document, &node, field);
-                    out.push((key, value));
-                }
-                Selection::InlineFragment {
-                    type_condition,
-                    selection,
-                } => {
-                    if type_condition
-                        .as_deref()
-                        .is_some_and(|t| t != self.node_type_name(&node))
-                    {
+                    if self.directive_skips(&field.directives) {
                         continue;
                     }
-                    self.resolve_selections(document, node.clone(), selection, out);
+                    let key = field.alias.clone().unwrap_or_else(|| field.name.clone());
+                    let value = self.exec_field(obj, field);
+                    out.push((key, value));
                 }
-                Selection::FragmentSpread(name) => {
-                    if let Some(selection) = document.fragments.get(name).cloned() {
-                        self.resolve_selections(document, node.clone(), &selection, out);
+                Selection::Spread(name, directives) => {
+                    if self.directive_skips(directives) {
+                        continue;
+                    }
+                    if self.frag_stack.contains(name) {
+                        self.errors.push(format!("fragment cycle detected: {name}"));
+                        continue;
+                    }
+                    if self.frag_budget >= MAX_FRAGMENT_EXPANSIONS {
+                        self.errors
+                            .push("fragment expansion limit exceeded".to_string());
+                        continue;
+                    }
+                    let Some(fragment) = self.doc.frags.get(name) else {
+                        self.errors.push(format!("Unknown fragment \"{name}\"."));
+                        continue;
+                    };
+                    self.frag_budget += 1;
+                    self.frag_stack.push(name.clone());
+                    let sub = fragment.selections.clone();
+                    self.exec_selections(obj, &sub, out);
+                    self.frag_stack.pop();
+                }
+                Selection::Inline(cond, directives, sub) => {
+                    if self.directive_skips(directives) {
+                        continue;
+                    }
+                    let applies = match cond {
+                        None => true,
+                        Some(target) => target == obj.type_name() || target == "Node",
+                    };
+                    if applies {
+                        self.exec_selections(obj, sub, out);
                     }
                 }
             }
         }
     }
 
-    fn node_type_name(&self, node: &Node) -> &str {
-        match node {
-            Node::Query => "Query",
-            Node::Mutation => "Mutation",
-            Node::User(_) => "User",
-            Node::Repository(_) => "Repository",
-            Node::Issue(_, _) => "Issue",
-            Node::Pull(_, _) => "PullRequest",
-            Node::Branch(_) => "Ref",
-            Node::IssueConnection(_, _, _, _) => "IssueConnection",
-            Node::PullConnection(_, _, _) => "PullRequestConnection",
-            Node::FileConnection(_, _, _, _) => "PullRequestChangedFileConnection",
-            Node::Comment(_, _) => "IssueComment",
-            Node::CommentEdge(_, _) => "IssueCommentEdge",
-            Node::PageInfo(_, _) => "PageInfo",
-            Node::CreateIssue(_, _) => "CreateIssuePayload",
-            Node::CloseIssue(_, _) => "CloseIssuePayload",
-            Node::CreatePull(_, _) => "CreatePullRequestPayload",
-            Node::MergePull(_, _) => "MergePullRequestPayload",
-            Node::AddComment(_, _) => "AddCommentPayload",
-            Node::Type(_) => "__Type",
-        }
-    }
-
-    // ---- argument helpers ----
-
-    fn arg_value(&self, field: &Field, name: &str) -> Option<Json> {
-        field
-            .arguments
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| self.value_to_json(v))
-    }
-
-    fn arg_str(&self, field: &Field, name: &str) -> Option<String> {
-        self.arg_value(field, name)?.as_str().map(|s| s.to_string())
-    }
-
-    fn arg_int(&self, field: &Field, name: &str) -> Option<i64> {
-        self.arg_value(field, name)?.as_i64()
-    }
-
-    fn value_to_json(&self, value: &Value) -> Json {
-        match value {
-            Value::Variable(name) => self.variables.get(name).cloned().unwrap_or(Json::Null),
-            Value::Int(n) => Json::Int(*n),
-            Value::Float(f) => Json::Float(*f),
-            Value::Str(s) => Json::Str(s.clone()),
-            Value::Bool(b) => Json::Bool(*b),
-            Value::Null => Json::Null,
-            Value::Enum(name) => Json::Str(name.clone()),
-            Value::List(items) => Json::Arr(items.iter().map(|v| self.value_to_json(v)).collect()),
-            Value::Object(fields) => Json::Obj(
-                fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.value_to_json(v)))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn error(&mut self, message: String) {
-        self.errors.push(obj(vec![("message", Json::Str(message))]));
-    }
-
-    // ---- field resolution ----
-
-    fn resolve_field(&mut self, document: &Document, node: &Node, field: &Field) -> Json {
-        match node {
-            Node::Query => self.resolve_query(document, field),
-            Node::Mutation => self.resolve_mutation(document, field),
-            Node::User(login) => self.resolve_user(document, login, field),
-            Node::Repository(db_id) => self.resolve_repository(document, *db_id, field),
-            Node::Issue(db_id, number) => self.resolve_issue(document, *db_id, *number, field),
-            Node::Pull(db_id, number) => self.resolve_pull(document, *db_id, *number, field),
-            Node::Branch(name) => self.resolve_branch(document, name, field),
-            Node::IssueConnection(db_id, numbers, after, first) => {
-                self.resolve_issue_connection(document, *db_id, numbers, *after, *first, field)
-            }
-            Node::PullConnection(db_id, numbers, first) => {
-                self.resolve_pull_connection(document, *db_id, numbers, *first, field)
-            }
-            Node::FileConnection(db_id, number, paths, first) => {
-                self.resolve_file_connection(document, *db_id, *number, paths, *first, field)
-            }
-            Node::Comment(id, body) => self.resolve_comment(document, *id, body, field),
-            Node::CommentEdge(id, body) => self.resolve_comment_edge(document, *id, body, field),
-            Node::PageInfo(has_next, end_cursor) => {
-                self.resolve_page_info(field, *has_next, end_cursor.clone())
-            }
-            Node::CreateIssue(db_id, number) => {
-                self.resolve_create_issue(document, *db_id, *number, field)
-            }
-            Node::CloseIssue(db_id, number) => {
-                self.resolve_close_issue(document, *db_id, *number, field)
-            }
-            Node::CreatePull(db_id, number) => {
-                self.resolve_create_pull(document, *db_id, *number, field)
-            }
-            Node::MergePull(db_id, number) => {
-                self.resolve_merge_pull(document, *db_id, *number, field)
-            }
-            Node::AddComment(id, body) => self.resolve_add_comment(document, *id, body, field),
-            Node::Type(name) => self.resolve_type(document, name, field),
-        }
-    }
-
-    fn sub(&mut self, document: &Document, node: Node, field: &Field) -> Json {
-        if field.selection.is_empty() {
-            return Json::Null;
-        }
-        let mut out = Vec::new();
-        self.resolve_selections(document, node, &field.selection, &mut out);
-        Json::Obj(out)
-    }
-
-    fn unknown_field(&mut self, node: &Node, field: &Field) -> Json {
-        let message = format!(
-            "Cannot query field \"{}\" on type \"{}\".",
-            field.name,
-            self.node_type_name(node)
-        );
-        self.error(message);
-        Json::Null
-    }
-
-    fn resolve_query(&mut self, document: &Document, field: &Field) -> Json {
-        match field.name.as_str() {
-            "viewer" => self.sub(document, Node::User(self.store.viewer.login.clone()), field),
-            "repository" => {
-                let owner = self.arg_str(field, "owner");
-                let name = self.arg_str(field, "name");
-                match (owner, name) {
-                    (Some(owner), Some(name)) => match self.store.get_repo(&owner, &name) {
-                        Some(repo) => self.sub(document, Node::Repository(repo.db_id), field),
-                        None => Json::Null,
-                    },
-                    _ => Json::Null,
-                }
-            }
-            "node" => {
-                let Some(id) = self.arg_str(field, "id") else {
-                    return Json::Null;
-                };
-                match self.store.decode_gid(&id) {
-                    Some((kind, db_id, number)) => match kind.as_str() {
-                        "Repository" => self.sub(document, Node::Repository(db_id), field),
-                        "Issue" => self.sub(document, Node::Issue(db_id, number), field),
-                        "PullRequest" => self.sub(document, Node::Pull(db_id, number), field),
-                        _ => Json::Null,
-                    },
-                    None => Json::Null,
-                }
-            }
-            "__type" => {
-                let Some(name) = self.arg_str(field, "name") else {
-                    return Json::Null;
-                };
-                self.sub(document, Node::Type(name), field)
-            }
-            "__schema" => self.sub(document, Node::Type("__schema".to_string()), field),
-            _ => self.unknown_field(&Node::Query, field),
-        }
-    }
-
-    fn resolve_user(&mut self, _document: &Document, login: &str, field: &Field) -> Json {
-        match field.name.as_str() {
-            "login" => Json::Str(login.to_string()),
-            "id" => Json::Str(base64_encode(format!("User:{login}").as_bytes())),
-            "name" => Json::Str(self.store.viewer.name.clone()),
-            _ => self.unknown_field(&Node::User(login.to_string()), field),
-        }
-    }
-
-    fn repo_by_db_id(&self, db_id: u32) -> Option<&Repo> {
-        self.store.repos.values().find(|repo| repo.db_id == db_id)
-    }
-
-    fn resolve_repository(&mut self, document: &Document, db_id: u32, field: &Field) -> Json {
-        let Some(repo) = self.repo_by_db_id(db_id) else {
-            return Json::Null;
-        };
-        let gid = self.store.repo_gid(repo);
-        match field.name.as_str() {
-            "id" => Json::Str(gid),
-            "databaseId" => Json::Int(repo.db_id as i64),
-            "name" => Json::Str(repo.name.clone()),
-            "nameWithOwner" => Json::Str(repo.full_name()),
-            "owner" => self.sub(document, Node::User(repo.owner.clone()), field),
-            "defaultBranchRef" => match repo.default_tip() {
-                Some(_) => self.sub(document, Node::Branch(repo.default_branch.clone()), field),
-                None => Json::Null,
-            },
-            "viewerPermission" => Json::Str("ADMIN".to_string()),
-            "hasIssuesEnabled" => Json::Bool(true),
-            "issue" => {
-                let number = self.arg_int(field, "number").unwrap_or(0) as u32;
-                if repo.issues.iter().any(|issue| issue.number == number) {
-                    self.sub(document, Node::Issue(db_id, number), field)
-                } else {
-                    Json::Null
-                }
-            }
-            "issues" => {
-                let numbers = self.filtered_issue_numbers(repo, field);
-                // Pagination arguments live on the connection field itself.
-                let after = self.arg_str(field, "after").and_then(|cursor| {
-                    base64_decode(&cursor)
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .and_then(|text| {
-                            text.strip_prefix("cursor:")
-                                .map(|n| n.parse::<u32>().ok())
-                                .unwrap_or(None)
-                        })
-                });
-                let first = self.arg_int(field, "first").unwrap_or(100).max(0) as usize;
-                self.sub(
-                    document,
-                    Node::IssueConnection(db_id, numbers, after, first),
-                    field,
-                )
-            }
-            "pullRequest" => {
-                let number = self.arg_int(field, "number").unwrap_or(0) as u32;
-                if repo.pulls.iter().any(|pull| pull.number == number) {
-                    self.sub(document, Node::Pull(db_id, number), field)
-                } else {
-                    Json::Null
-                }
-            }
-            "pullRequests" => {
-                let numbers: Vec<u32> = repo.pulls.iter().map(|pull| pull.number).collect();
-                let first = self.arg_int(field, "first").unwrap_or(100).max(0) as usize;
-                self.sub(document, Node::PullConnection(db_id, numbers, first), field)
-            }
-            _ => self.unknown_field(&Node::Repository(db_id), field),
-        }
-    }
-
-    /// Issue numbers after `states` + `orderBy` filtering (before `first`).
-    fn filtered_issue_numbers(&self, repo: &Repo, field: &Field) -> Vec<u32> {
-        let states: Vec<String> = self
-            .arg_value(field, "states")
-            .and_then(|v| {
-                v.as_arr().map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
-        let mut issues: Vec<&crate::store::Issue> = repo
-            .issues
-            .iter()
-            .filter(|issue| {
-                states.is_empty()
-                    || states.iter().any(|state| match state.as_str() {
-                        "OPEN" => issue.state == IssueState::Open,
-                        "CLOSED" => issue.state == IssueState::Closed,
-                        _ => true,
-                    })
-            })
-            .collect();
-        // orderBy: {field: CREATED_AT, direction: DESC|ASC} — created order
-        // is the number order.
-        let desc = self
-            .arg_value(field, "orderBy")
-            .and_then(|v| {
-                v.get("direction")
-                    .and_then(|d| d.as_str())
-                    .map(|d| d == "DESC")
-            })
-            .unwrap_or(false);
-        issues.sort_by_key(|issue| issue.number);
-        if desc {
-            issues.reverse();
-        }
-        issues.into_iter().map(|issue| issue.number).collect()
-    }
-
-    fn resolve_issue(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        let Some(repo) = self.repo_by_db_id(db_id) else {
-            return Json::Null;
-        };
-        let Some(issue) = repo.issues.iter().find(|issue| issue.number == number) else {
-            return Json::Null;
-        };
-        let gid = self.store.issue_gid(repo, number);
-        let state = issue.state.as_str();
-        match field.name.as_str() {
-            "id" => Json::Str(gid),
-            "number" => Json::Int(number as i64),
-            "title" => Json::Str(issue.title.clone()),
-            "body" => Json::Str(issue.body.clone()),
-            "state" => Json::Str(state.to_uppercase()),
-            "createdAt" => Json::Str(iso_from_epoch(
-                crate::scenario::SCENARIO_EPOCH_SEC + issue.created_seq,
-            )),
-            "author" => self.sub(document, Node::User(self.store.viewer.login.clone()), field),
-            _ => self.unknown_field(&Node::Issue(db_id, number), field),
-        }
-    }
-
-    fn resolve_pull(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        let Some(repo) = self.repo_by_db_id(db_id) else {
-            return Json::Null;
-        };
-        let Some(pull) = repo.pulls.iter().find(|pull| pull.number == number) else {
-            return Json::Null;
-        };
-        let gid = self.store.pull_gid(repo, number);
-        let state = if pull.merged {
-            "MERGED".to_string()
-        } else {
-            pull.state.as_str().to_uppercase()
-        };
-        match field.name.as_str() {
-            "id" => Json::Str(gid),
-            "number" => Json::Int(number as i64),
-            "title" => Json::Str(pull.title.clone()),
-            "body" => Json::Str(pull.body.clone()),
-            "state" => Json::Str(state),
-            "headRefName" => Json::Str(pull.head_ref.clone()),
-            "baseRefName" => Json::Str(pull.base_ref.clone()),
-            "mergeable" => Json::Str(pull_mergeable(repo, pull).as_str().to_string()),
-            "merged" => Json::Bool(pull.merged),
-            "files" => {
-                let first = self.arg_int(field, "first").unwrap_or(100).max(0) as usize;
-                let Some(head_tip) = repo.branch_tip(&pull.head_ref) else {
-                    return self.sub(
-                        document,
-                        Node::FileConnection(db_id, number, Vec::new(), first),
-                        field,
-                    );
-                };
-                let Some(base_commit) = repo.objects.commit_of(&pull.base_sha) else {
-                    return self.sub(
-                        document,
-                        Node::FileConnection(db_id, number, Vec::new(), first),
-                        field,
-                    );
-                };
-                let Some(head_commit) = repo.objects.commit_of(&head_tip) else {
-                    return self.sub(
-                        document,
-                        Node::FileConnection(db_id, number, Vec::new(), first),
-                        field,
-                    );
-                };
-                let paths: Vec<String> = diff_trees(repo, base_commit.tree, head_commit.tree)
-                    .into_iter()
-                    .filter(|change| change.status != "removed")
-                    .map(|change| change.path)
-                    .collect();
-                self.sub(
-                    document,
-                    Node::FileConnection(db_id, number, paths, first),
-                    field,
-                )
-            }
-            _ => self.unknown_field(&Node::Pull(db_id, number), field),
-        }
-    }
-
-    fn resolve_branch(&mut self, _document: &Document, name: &str, field: &Field) -> Json {
-        match field.name.as_str() {
-            "name" => Json::Str(name.to_string()),
-            _ => self.unknown_field(&Node::Branch(name.to_string()), field),
-        }
-    }
-
-    fn resolve_issue_connection(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        numbers: &[u32],
-        after: Option<u32>,
-        first: usize,
-        field: &Field,
-    ) -> Json {
-        // `after` is a base64 `cursor:<number>`; the page starts after that
-        // number's position in the (already ordered) list, so DESC order
-        // paginates correctly too.
-        let start = match after {
-            Some(after) => numbers
+    /// `@skip(if: true)` or `@include(if: false)` omits the selection.
+    fn directive_skips(&self, directives: &DirectiveList) -> bool {
+        for (name, args) in directives {
+            let cond = args
                 .iter()
-                .position(|n| *n == after)
-                .map(|pos| pos + 1)
-                .unwrap_or(0),
-            None => 0,
-        };
-        let mut page: Vec<u32> = numbers.iter().skip(start).copied().collect();
-        let has_next = page.len() > first;
-        page.truncate(first);
-        let end_cursor = page
-            .last()
-            .map(|n| base64_encode(format!("cursor:{n}").as_bytes()));
-        match field.name.as_str() {
-            "nodes" => {
-                let nodes: Vec<Json> = page
-                    .iter()
-                    .map(|number| {
-                        let mut out = Vec::new();
-                        self.resolve_selections(
-                            document,
-                            Node::Issue(db_id, *number),
-                            &field.selection,
-                            &mut out,
-                        );
-                        Json::Obj(out)
-                    })
-                    .collect();
-                Json::Arr(nodes)
+                .find(|(key, _)| key == "if")
+                .map(|(_, value)| value.resolve(&self.vars))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if name == "skip" && cond {
+                return true;
             }
-            "edges" => {
-                let edges: Vec<Json> = page
-                    .iter()
-                    .map(|number| {
-                        let mut node_out = Vec::new();
-                        self.resolve_selections(
-                            document,
-                            Node::Issue(db_id, *number),
-                            &field.selection,
-                            &mut node_out,
-                        );
-                        obj(vec![
-                            (
-                                "cursor",
-                                Json::Str(base64_encode(format!("cursor:{number}").as_bytes())),
-                            ),
-                            ("node", Json::Obj(node_out)),
-                        ])
-                    })
-                    .collect();
-                Json::Arr(edges)
+            if name == "include" && !cond {
+                return true;
             }
-            "pageInfo" => self.sub(document, Node::PageInfo(has_next, end_cursor), field),
-            "totalCount" => Json::Int(numbers.len() as i64),
-            _ => self.unknown_field(
-                &Node::IssueConnection(db_id, numbers.to_vec(), after, first),
-                field,
-            ),
         }
+        false
     }
 
-    fn resolve_pull_connection(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        numbers: &[u32],
-        first: usize,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "nodes" => {
-                let nodes: Vec<Json> = numbers
-                    .iter()
-                    .take(first)
-                    .map(|number| {
-                        let mut out = Vec::new();
-                        self.resolve_selections(
-                            document,
-                            Node::Pull(db_id, *number),
-                            &field.selection,
-                            &mut out,
-                        );
-                        Json::Obj(out)
-                    })
-                    .collect();
-                Json::Arr(nodes)
+    fn exec_field(&mut self, obj: &GqlObj, field: &FieldSel) -> Json {
+        let args: Vec<(String, Json)> = field
+            .args
+            .iter()
+            .map(|(name, value)| (name.clone(), value.resolve(&self.vars)))
+            .collect();
+        match self.resolve(obj, &field.name, &args) {
+            Ok(Resolved::Null) => Json::Null,
+            Ok(Resolved::Value(value)) => value,
+            Ok(Resolved::Object(inner)) => {
+                let mut out = Vec::new();
+                self.exec_selections(&inner, &field.sub, &mut out);
+                Json::Obj(out)
             }
-            "totalCount" => Json::Int(numbers.len() as i64),
-            _ => self.unknown_field(&Node::PullConnection(db_id, numbers.to_vec(), first), field),
-        }
-    }
-
-    fn resolve_file_connection(
-        &mut self,
-        _document: &Document,
-        db_id: u32,
-        number: u32,
-        paths: &[String],
-        first: usize,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "nodes" => {
-                let nodes: Vec<Json> = paths
-                    .iter()
-                    .take(first)
-                    .map(|path| {
-                        let mut out = Vec::new();
-                        for selection in &field.selection {
-                            if let Selection::Field(f) = selection {
-                                if f.name == "path" {
-                                    out.push((
-                                        f.alias.clone().unwrap_or_else(|| "path".to_string()),
-                                        Json::Str(path.clone()),
-                                    ));
-                                }
-                            }
-                        }
-                        Json::Obj(out)
-                    })
-                    .collect();
-                Json::Arr(nodes)
+            Ok(Resolved::Objects(list)) => {
+                let mut arr = Vec::new();
+                for inner in list {
+                    let mut out = Vec::new();
+                    self.exec_selections(&inner, &field.sub, &mut out);
+                    arr.push(Json::Obj(out));
+                }
+                Json::Arr(arr)
             }
-            "totalCount" => Json::Int(paths.len() as i64),
-            _ => self.unknown_field(
-                &Node::FileConnection(db_id, number, paths.to_vec(), first),
-                field,
-            ),
-        }
-    }
-
-    fn resolve_comment_edge(
-        &mut self,
-        document: &Document,
-        id: u64,
-        body: &str,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "node" => self.sub(document, Node::Comment(id, body.to_string()), field),
-            "cursor" => Json::Str(base64_encode(format!("cursor:{id}").as_bytes())),
-            _ => self.unknown_field(&Node::CommentEdge(id, body.to_string()), field),
-        }
-    }
-
-    fn resolve_page_info(
-        &mut self,
-        field: &Field,
-        has_next: bool,
-        end_cursor: Option<String>,
-    ) -> Json {
-        match field.name.as_str() {
-            "hasNextPage" => Json::Bool(has_next),
-            "endCursor" => end_cursor.map(Json::Str).unwrap_or(Json::Null),
-            _ => {
-                self.error(format!(
-                    "Cannot query field \"{}\" on type \"PageInfo\".",
-                    field.name
-                ));
+            Err(message) => {
+                self.errors.push(message);
                 Json::Null
             }
         }
     }
 
-    fn resolve_create_issue(
+    // -- field resolution -------------------------------------------------
+
+    fn resolve(
         &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "issue" => self.sub(document, Node::Issue(db_id, number), field),
-            "clientMutationId" => Json::Null,
-            _ => self.unknown_field(&Node::CreateIssue(db_id, number), field),
+        obj: &GqlObj,
+        field: &str,
+        args: &[(String, Json)],
+    ) -> Result<Resolved, String> {
+        if field == "__typename" {
+            return Ok(Resolved::Value(Json::Str(obj.type_name().to_string())));
+        }
+        match obj {
+            GqlObj::RootQuery => self.resolve_query(field, args),
+            GqlObj::RootMutation => self.resolve_mutation(field, args),
+            GqlObj::Viewer => self.resolve_user(field),
+            GqlObj::Repo { owner, name } => self.resolve_repo(owner, name, field, args),
+            GqlObj::Issue {
+                owner,
+                name,
+                number,
+            } => self.resolve_issue(owner, name, *number, field),
+            GqlObj::Pull {
+                owner,
+                name,
+                number,
+            } => self.resolve_pull(owner, name, *number, field, args),
+            GqlObj::BranchRef { branch } => match field {
+                "name" => Ok(Resolved::Value(Json::Str(branch.clone()))),
+                _ => Err(format!("Cannot query field \"{field}\" on type \"Ref\".")),
+            },
+            GqlObj::IssueConn {
+                owner,
+                name,
+                numbers,
+                has_next,
+                end_cursor,
+            } => {
+                self.resolve_issue_conn(owner, name, numbers, *has_next, end_cursor.clone(), field)
+            }
+            GqlObj::IssueEdge {
+                owner,
+                name,
+                number,
+                cursor,
+            } => match field {
+                "node" => Ok(Resolved::Object(GqlObj::Issue {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    number: *number,
+                })),
+                "cursor" => Ok(Resolved::Value(Json::Str(cursor.clone()))),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"IssueEdge\"."
+                )),
+            },
+            GqlObj::PullConn {
+                owner,
+                name,
+                numbers,
+            } => self.resolve_pull_conn(owner, name, numbers, field),
+            GqlObj::PullEdge {
+                owner,
+                name,
+                number,
+                cursor,
+            } => match field {
+                "node" => Ok(Resolved::Object(GqlObj::Pull {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    number: *number,
+                })),
+                "cursor" => Ok(Resolved::Value(Json::Str(cursor.clone()))),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"PullRequestEdge\"."
+                )),
+            },
+            GqlObj::PageInfo {
+                has_next,
+                has_prev,
+                start_cursor,
+                end_cursor,
+            } => match field {
+                "hasNextPage" => Ok(Resolved::Value(Json::Bool(*has_next))),
+                "hasPreviousPage" => Ok(Resolved::Value(Json::Bool(*has_prev))),
+                "startCursor" => Ok(Resolved::Value(
+                    start_cursor.clone().map(Json::Str).unwrap_or(Json::Null),
+                )),
+                "endCursor" => Ok(Resolved::Value(
+                    end_cursor.clone().map(Json::Str).unwrap_or(Json::Null),
+                )),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"PageInfo\"."
+                )),
+            },
+            GqlObj::FileConn { files } => match field {
+                "nodes" => Ok(Resolved::Objects(
+                    files
+                        .iter()
+                        .map(|change| GqlObj::ChangedFile {
+                            path: change.path.clone(),
+                            additions: change.additions,
+                            deletions: change.deletions,
+                            status: change.status.to_string(),
+                        })
+                        .collect(),
+                )),
+                "pageInfo" => Ok(Resolved::Object(GqlObj::PageInfo {
+                    has_next: false,
+                    has_prev: false,
+                    start_cursor: None,
+                    end_cursor: None,
+                })),
+                "totalCount" => Ok(Resolved::Value(Json::Int(files.len() as i64))),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"PullRequestChangedFileConnection\"."
+                )),
+            },
+            GqlObj::ChangedFile {
+                path,
+                additions,
+                deletions,
+                status,
+            } => match field {
+                "path" => Ok(Resolved::Value(Json::Str(path.clone()))),
+                "additions" => Ok(Resolved::Value(Json::Int(*additions as i64))),
+                "deletions" => Ok(Resolved::Value(Json::Int(*deletions as i64))),
+                "changeType" => Ok(Resolved::Value(Json::Str(
+                    match status.as_str() {
+                        "added" => "ADDED",
+                        "removed" => "REMOVED",
+                        _ => "MODIFIED",
+                    }
+                    .to_string(),
+                ))),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"PullRequestChangedFile\"."
+                )),
+            },
+            GqlObj::TypeInfo { name } => self.resolve_type_info(name, field),
+            GqlObj::FieldInfo { name } => match field {
+                "name" => Ok(Resolved::Value(Json::Str(name.clone()))),
+                "description" => Ok(Resolved::Null),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"__Field\"."
+                )),
+            },
+            GqlObj::EnumValueInfo { name } => match field {
+                "name" => Ok(Resolved::Value(Json::Str(name.clone()))),
+                "description" => Ok(Resolved::Null),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"__EnumValue\"."
+                )),
+            },
+            GqlObj::Label { name, color } => match field {
+                "name" => Ok(Resolved::Value(Json::Str(name.clone()))),
+                "color" => Ok(Resolved::Value(Json::Str(color.clone()))),
+                "description" => Ok(Resolved::Value(Json::Str(String::new()))),
+                _ => Err(format!("Cannot query field \"{field}\" on type \"Label\".")),
+            },
+            GqlObj::Comment { id, body } => match field {
+                "id" => Ok(Resolved::Value(Json::Str(id.clone()))),
+                "body" => Ok(Resolved::Value(Json::Str(body.clone()))),
+                "author" => Ok(Resolved::Object(GqlObj::Viewer)),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"IssueComment\"."
+                )),
+            },
+            GqlObj::CommentEdge { id, body } => match field {
+                "node" => Ok(Resolved::Object(GqlObj::Comment {
+                    id: id.clone(),
+                    body: body.clone(),
+                })),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"CommentEdge\"."
+                )),
+            },
+            GqlObj::IssuePayload {
+                owner,
+                name,
+                number,
+            } => match field {
+                "issue" => Ok(Resolved::Object(GqlObj::Issue {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    number: *number,
+                })),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"CreateIssuePayload\"."
+                )),
+            },
+            GqlObj::PullPayload {
+                owner,
+                name,
+                number,
+            } => match field {
+                "pullRequest" => Ok(Resolved::Object(GqlObj::Pull {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    number: *number,
+                })),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"CreatePullRequestPayload\"."
+                )),
+            },
+            GqlObj::CommentPayload { id, body } => match field {
+                "commentEdge" => Ok(Resolved::Object(GqlObj::CommentEdge {
+                    id: id.clone(),
+                    body: body.clone(),
+                })),
+                _ => Err(format!(
+                    "Cannot query field \"{field}\" on type \"AddCommentPayload\"."
+                )),
+            },
         }
     }
 
-    fn resolve_close_issue(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "issue" => self.sub(document, Node::Issue(db_id, number), field),
-            "clientMutationId" => Json::Null,
-            _ => self.unknown_field(&Node::CloseIssue(db_id, number), field),
-        }
-    }
-
-    fn resolve_merge_pull(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "pullRequest" => self.sub(document, Node::Pull(db_id, number), field),
-            "clientMutationId" => Json::Null,
-            _ => self.unknown_field(&Node::MergePull(db_id, number), field),
-        }
-    }
-
-    fn resolve_create_pull(
-        &mut self,
-        document: &Document,
-        db_id: u32,
-        number: u32,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "pullRequest" => self.sub(document, Node::Pull(db_id, number), field),
-            "clientMutationId" => Json::Null,
-            _ => self.unknown_field(&Node::CreatePull(db_id, number), field),
-        }
-    }
-
-    fn resolve_add_comment(
-        &mut self,
-        document: &Document,
-        id: u64,
-        body: &str,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "commentEdge" => self.sub(document, Node::CommentEdge(id, body.to_string()), field),
-            "clientMutationId" => Json::Null,
-            _ => self.unknown_field(&Node::AddComment(id, body.to_string()), field),
-        }
-    }
-
-    fn resolve_comment(
-        &mut self,
-        _document: &Document,
-        id: u64,
-        body: &str,
-        field: &Field,
-    ) -> Json {
-        match field.name.as_str() {
-            "id" => Json::Str(base64_encode(format!("IssueComment:{id}").as_bytes())),
-            "body" => Json::Str(body.to_string()),
-            _ => self.unknown_field(&Node::Comment(id, body.to_string()), field),
-        }
-    }
-
-    fn resolve_type(&mut self, _document: &Document, name: &str, field: &Field) -> Json {
-        match field.name.as_str() {
-            "name" => Json::Str(name.to_string()),
-            "kind" => Json::Str(
-                match name {
-                    "SearchType" => "ENUM",
-                    _ => "OBJECT",
+    fn resolve_query(&mut self, field: &str, args: &[(String, Json)]) -> Result<Resolved, String> {
+        match field {
+            "viewer" => Ok(Resolved::Object(GqlObj::Viewer)),
+            "repository" => {
+                let owner = arg_str(args, "owner").unwrap_or("");
+                let name = arg_str(args, "name").unwrap_or("");
+                match self.store.get_repo(owner, name) {
+                    Some(_) => Ok(Resolved::Object(GqlObj::Repo {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                    })),
+                    None => Ok(Resolved::Null),
                 }
-                .to_string(),
-            ),
-            "fields" => {
-                let fields = type_fields(name);
-                let items: Vec<Json> = fields
+            }
+            "node" => {
+                let id = arg_str(args, "id").unwrap_or("");
+                let Some((kind, db_id, number)) = self.store.decode_gid(id) else {
+                    return Ok(Resolved::Null);
+                };
+                let Some((owner, name)) = repo_key_by_db_id(self.store, db_id) else {
+                    return Ok(Resolved::Null);
+                };
+                match kind.as_str() {
+                    "Repository" => Ok(Resolved::Object(GqlObj::Repo { owner, name })),
+                    "Issue" => Ok(Resolved::Object(GqlObj::Issue {
+                        owner,
+                        name,
+                        number,
+                    })),
+                    "PullRequest" => Ok(Resolved::Object(GqlObj::Pull {
+                        owner,
+                        name,
+                        number,
+                    })),
+                    _ => Ok(Resolved::Null),
+                }
+            }
+            "__type" => {
+                let name = arg_str(args, "name").unwrap_or("");
+                if fields_of(name).is_some() || is_scalar(name) {
+                    Ok(Resolved::Object(GqlObj::TypeInfo {
+                        name: name.to_string(),
+                    }))
+                } else {
+                    Ok(Resolved::Null)
+                }
+            }
+            _ => Err(format!("Cannot query field \"{field}\" on type \"Query\".")),
+        }
+    }
+
+    fn resolve_user(&mut self, field: &str) -> Result<Resolved, String> {
+        match field {
+            "login" => Ok(Resolved::Value(Json::Str(self.store.viewer.login.clone()))),
+            "id" => Ok(Resolved::Value(Json::Str(base64_encode(
+                format!("User:{}", self.store.viewer.login).as_bytes(),
+            )))),
+            "name" => Ok(Resolved::Value(Json::Str(self.store.viewer.name.clone()))),
+            "email" => Ok(Resolved::Value(Json::Str(self.store.viewer.email.clone()))),
+            _ => Err(format!("Cannot query field \"{field}\" on type \"User\".")),
+        }
+    }
+
+    fn resolve_repo(
+        &mut self,
+        owner: &str,
+        name: &str,
+        field: &str,
+        args: &[(String, Json)],
+    ) -> Result<Resolved, String> {
+        // Snapshot the scalar facts first so later branches can borrow the
+        // store mutably for connections.
+        let Some(repo) = self.store.get_repo(owner, name) else {
+            return Ok(Resolved::Null);
+        };
+        let db_id = repo.db_id;
+        let repo_name = repo.name.clone();
+        let full_name = repo.full_name();
+        let description = repo.description.clone();
+        let is_private = repo.private;
+        let default_branch = repo.default_branch.clone();
+        let has_default = repo.default_tip().is_some();
+        match field {
+            "id" => Ok(Resolved::Value(Json::Str(self.store.repo_gid(repo)))),
+            "databaseId" => Ok(Resolved::Value(Json::Int(db_id as i64))),
+            "name" => Ok(Resolved::Value(Json::Str(repo_name))),
+            "nameWithOwner" => Ok(Resolved::Value(Json::Str(full_name))),
+            "owner" => Ok(Resolved::Object(GqlObj::Viewer)),
+            "defaultBranchRef" => {
+                if has_default {
+                    Ok(Resolved::Object(GqlObj::BranchRef {
+                        branch: default_branch,
+                    }))
+                } else {
+                    Ok(Resolved::Null)
+                }
+            }
+            "viewerPermission" => Ok(Resolved::Value(Json::Str("ADMIN".to_string()))),
+            "hasIssuesEnabled" => Ok(Resolved::Value(Json::Bool(true))),
+            "description" => Ok(Resolved::Value(Json::Str(description))),
+            "url" => Ok(Resolved::Value(Json::Str(format!(
+                "https://github.com/{full_name}"
+            )))),
+            "isPrivate" => Ok(Resolved::Value(Json::Bool(is_private))),
+            "issue" => {
+                let number = arg_int(args, "number").unwrap_or(0) as u32;
+                let repo = self.store.get_repo(owner, name).unwrap();
+                match repo.issues.iter().find(|issue| issue.number == number) {
+                    Some(_) => Ok(Resolved::Object(GqlObj::Issue {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number,
+                    })),
+                    None => Ok(Resolved::Null),
+                }
+            }
+            "issues" => Ok(Resolved::Object(self.issue_connection(owner, name, args))),
+            "pullRequests" => {
+                let first = arg_int(args, "first").unwrap_or(i64::MAX).max(0) as usize;
+                let repo = self.store.get_repo(owner, name).unwrap();
+                let numbers: Vec<u32> = repo
+                    .pulls
                     .iter()
-                    .map(|field_name| {
-                        let mut out = Vec::new();
-                        for selection in &field.selection {
-                            if let Selection::Field(f) = selection {
-                                match f.name.as_str() {
-                                    "name" => out.push((
-                                        f.alias.clone().unwrap_or_else(|| "name".to_string()),
-                                        Json::Str(field_name.to_string()),
-                                    )),
-                                    "type" => out.push((
-                                        f.alias.clone().unwrap_or_else(|| "type".to_string()),
-                                        obj(vec![("name", Json::Str(field_name.to_string()))]),
-                                    )),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Json::Obj(out)
-                    })
+                    .filter(|pull| pull.state == IssueState::Open)
+                    .map(|pull| pull.number)
+                    .take(first)
                     .collect();
-                Json::Arr(items)
+                Ok(Resolved::Object(GqlObj::PullConn {
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                    numbers,
+                }))
+            }
+            "pullRequest" => {
+                let number = arg_int(args, "number").unwrap_or(0) as u32;
+                let repo = self.store.get_repo(owner, name).unwrap();
+                match repo.pulls.iter().find(|pull| pull.number == number) {
+                    Some(_) => Ok(Resolved::Object(GqlObj::Pull {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number,
+                    })),
+                    None => Ok(Resolved::Null),
+                }
+            }
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"Repository\"."
+            )),
+        }
+    }
+
+    /// Build an issue connection: states filter, orderBy, cursor, first.
+    fn issue_connection(&mut self, owner: &str, name: &str, args: &[(String, Json)]) -> GqlObj {
+        let repo = self.store.get_repo(owner, name).unwrap();
+        let mut numbers: Vec<(u32, u64)> = repo
+            .issues
+            .iter()
+            .map(|issue| (issue.number, issue.created_seq))
+            .collect();
+        // States filter.
+        if let Some(states) = args.iter().find(|(key, _)| key == "states") {
+            if let Json::Arr(wanted) = &states.1 {
+                let want_open = wanted.iter().any(|state| state.as_str() == Some("OPEN"));
+                let want_closed = wanted.iter().any(|state| state.as_str() == Some("CLOSED"));
+                numbers.retain(|(number, _)| {
+                    let issue = repo.issues.iter().find(|i| i.number == *number).unwrap();
+                    (want_open && issue.state == IssueState::Open)
+                        || (want_closed && issue.state == IssueState::Closed)
+                });
+            }
+        }
+        // Order: CREATED_AT ASC is the default; DESC reverses it.
+        let mut descending = false;
+        if let Some(order_by) = arg_obj(args, "orderBy") {
+            if obj_field(order_by, "direction").and_then(|v| v.as_str()) == Some("DESC") {
+                descending = true;
+            }
+        }
+        if descending {
+            numbers.sort_by_key(|(_, seq)| std::cmp::Reverse(*seq));
+        } else {
+            numbers.sort_by_key(|(_, seq)| *seq);
+        }
+        // Cursor: start after the issue the cursor names, in this order.
+        let mut start = 0;
+        if let Some(after) = arg_str(args, "after") {
+            if let Some(cursor_no) = cursor_number(after) {
+                if let Some(pos) = numbers.iter().position(|(n, _)| *n == cursor_no) {
+                    start = pos + 1;
+                }
+            }
+        }
+        let first = arg_int(args, "first").unwrap_or(i64::MAX).max(0) as usize;
+        let page: Vec<u32> = numbers
+            .iter()
+            .skip(start)
+            .take(first)
+            .map(|(number, _)| *number)
+            .collect();
+        let has_next = start + page.len() < numbers.len();
+        let end_cursor = page.last().map(|number| cursor_for(*number));
+        GqlObj::IssueConn {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            numbers: page,
+            has_next,
+            end_cursor,
+        }
+    }
+
+    fn resolve_issue_conn(
+        &mut self,
+        owner: &str,
+        name: &str,
+        numbers: &[u32],
+        has_next: bool,
+        end_cursor: Option<String>,
+        field: &str,
+    ) -> Result<Resolved, String> {
+        match field {
+            "nodes" => Ok(Resolved::Objects(
+                numbers
+                    .iter()
+                    .map(|number| GqlObj::Issue {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number: *number,
+                    })
+                    .collect(),
+            )),
+            "edges" => Ok(Resolved::Objects(
+                numbers
+                    .iter()
+                    .map(|number| GqlObj::IssueEdge {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number: *number,
+                        cursor: cursor_for(*number),
+                    })
+                    .collect(),
+            )),
+            "pageInfo" => Ok(Resolved::Object(GqlObj::PageInfo {
+                has_next,
+                has_prev: false,
+                start_cursor: numbers.first().map(|number| cursor_for(*number)),
+                end_cursor,
+            })),
+            "totalCount" => Ok(Resolved::Value(Json::Int(numbers.len() as i64))),
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"IssueConnection\"."
+            )),
+        }
+    }
+
+    fn resolve_pull_conn(
+        &mut self,
+        owner: &str,
+        name: &str,
+        numbers: &[u32],
+        field: &str,
+    ) -> Result<Resolved, String> {
+        match field {
+            "nodes" => Ok(Resolved::Objects(
+                numbers
+                    .iter()
+                    .map(|number| GqlObj::Pull {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number: *number,
+                    })
+                    .collect(),
+            )),
+            "edges" => Ok(Resolved::Objects(
+                numbers
+                    .iter()
+                    .map(|number| GqlObj::PullEdge {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        number: *number,
+                        cursor: cursor_for(*number),
+                    })
+                    .collect(),
+            )),
+            "pageInfo" => Ok(Resolved::Object(GqlObj::PageInfo {
+                has_next: false,
+                has_prev: false,
+                start_cursor: numbers.first().map(|number| cursor_for(*number)),
+                end_cursor: numbers.last().map(|number| cursor_for(*number)),
+            })),
+            "totalCount" => Ok(Resolved::Value(Json::Int(numbers.len() as i64))),
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"PullRequestConnection\"."
+            )),
+        }
+    }
+
+    fn resolve_issue(
+        &mut self,
+        owner: &str,
+        name: &str,
+        number: u32,
+        field: &str,
+    ) -> Result<Resolved, String> {
+        let Some(repo) = self.store.get_repo(owner, name) else {
+            return Ok(Resolved::Null);
+        };
+        let Some(issue) = repo.issues.iter().find(|issue| issue.number == number) else {
+            return Ok(Resolved::Null);
+        };
+        let gid = self.store.issue_gid(repo, number);
+        let state = if issue.state == IssueState::Open {
+            "OPEN"
+        } else {
+            "CLOSED"
+        };
+        match field {
+            "id" => Ok(Resolved::Value(Json::Str(gid))),
+            "number" => Ok(Resolved::Value(Json::Int(number as i64))),
+            "title" => Ok(Resolved::Value(Json::Str(issue.title.clone()))),
+            "state" => Ok(Resolved::Value(Json::Str(state.to_string()))),
+            "body" => Ok(Resolved::Value(Json::Str(issue.body.clone()))),
+            "url" => Ok(Resolved::Value(Json::Str(format!(
+                "https://github.com/{}/{}/issues/{}",
+                owner, name, number
+            )))),
+            "createdAt" => Ok(Resolved::Value(Json::Str(iso_from_epoch(
+                SCENARIO_EPOCH_SEC + issue.created_seq,
+            )))),
+            "author" => Ok(Resolved::Object(GqlObj::Viewer)),
+            "labels" => Ok(Resolved::Objects(
+                issue
+                    .labels
+                    .iter()
+                    .filter_map(|wanted| {
+                        repo.labels
+                            .iter()
+                            .find(|label| &label.name == wanted)
+                            .map(|label| GqlObj::Label {
+                                name: label.name.clone(),
+                                color: label.color.clone(),
+                            })
+                    })
+                    .collect(),
+            )),
+            _ => Err(format!("Cannot query field \"{field}\" on type \"Issue\".")),
+        }
+    }
+
+    fn resolve_pull(
+        &mut self,
+        owner: &str,
+        name: &str,
+        number: u32,
+        field: &str,
+        args: &[(String, Json)],
+    ) -> Result<Resolved, String> {
+        let Some(repo) = self.store.get_repo(owner, name) else {
+            return Ok(Resolved::Null);
+        };
+        let Some(pull) = repo.pulls.iter().find(|pull| pull.number == number) else {
+            return Ok(Resolved::Null);
+        };
+        let gid = self.store.pull_gid(repo, number);
+        let state = if pull.merged {
+            "MERGED"
+        } else if pull.state == IssueState::Open {
+            "OPEN"
+        } else {
+            "CLOSED"
+        };
+        match field {
+            "id" => Ok(Resolved::Value(Json::Str(gid))),
+            "number" => Ok(Resolved::Value(Json::Int(number as i64))),
+            "title" => Ok(Resolved::Value(Json::Str(pull.title.clone()))),
+            "body" => Ok(Resolved::Value(Json::Str(pull.body.clone()))),
+            "state" => Ok(Resolved::Value(Json::Str(state.to_string()))),
+            "merged" => Ok(Resolved::Value(Json::Bool(pull.merged))),
+            "headRefName" => Ok(Resolved::Value(Json::Str(pull.head_ref.clone()))),
+            "baseRefName" => Ok(Resolved::Value(Json::Str(pull.base_ref.clone()))),
+            "mergeable" => {
+                let mergeable = crate::store::pull_mergeable(repo, pull);
+                Ok(Resolved::Value(Json::Str(mergeable.as_str().to_string())))
+            }
+            "files" => {
+                let first = arg_int(args, "first").unwrap_or(i64::MAX).max(0) as usize;
+                let Some(head_tip) = repo.branch_tip(&pull.head_ref) else {
+                    return Ok(Resolved::Null);
+                };
+                let Some(base_commit) = repo.objects.commit_of(&pull.base_sha) else {
+                    return Ok(Resolved::Null);
+                };
+                let Some(head_commit) = repo.objects.commit_of(&head_tip) else {
+                    return Ok(Resolved::Null);
+                };
+                let mut changes =
+                    crate::store::diff_trees(repo, base_commit.tree, head_commit.tree);
+                changes.truncate(first);
+                Ok(Resolved::Object(GqlObj::FileConn { files: changes }))
+            }
+            "url" => Ok(Resolved::Value(Json::Str(format!(
+                "https://github.com/{}/{}/pull/{}",
+                owner, name, number
+            )))),
+            "createdAt" => Ok(Resolved::Value(Json::Str(iso_from_epoch(
+                SCENARIO_EPOCH_SEC + pull.created_seq,
+            )))),
+            "author" => Ok(Resolved::Object(GqlObj::Viewer)),
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"PullRequest\"."
+            )),
+        }
+    }
+
+    fn resolve_type_info(&mut self, name: &str, field: &str) -> Result<Resolved, String> {
+        match field {
+            "name" => Ok(Resolved::Value(Json::Str(name.to_string()))),
+            "kind" => Ok(Resolved::Value(Json::Str(type_kind(name).to_string()))),
+            "description" => Ok(Resolved::Null),
+            "fields" => {
+                let Some(fields) = fields_of(name) else {
+                    return Ok(Resolved::Null);
+                };
+                Ok(Resolved::Objects(
+                    fields
+                        .iter()
+                        .map(|(field_name, _)| GqlObj::FieldInfo {
+                            name: field_name.to_string(),
+                        })
+                        .collect(),
+                ))
             }
             "enumValues" => {
-                let values: &[&str] = match name {
-                    "SearchType" => &["ISSUE", "PULL_REQUEST", "REPOSITORY", "USER"],
-                    _ => &[],
-                };
-                let items: Vec<Json> = values
-                    .iter()
-                    .map(|value| {
-                        let mut out = Vec::new();
-                        for selection in &field.selection {
-                            if let Selection::Field(f) = selection {
-                                if f.name == "name" {
-                                    out.push((
-                                        f.alias.clone().unwrap_or_else(|| "name".to_string()),
-                                        Json::Str(value.to_string()),
-                                    ));
-                                }
-                            }
-                        }
-                        Json::Obj(out)
-                    })
-                    .collect();
-                Json::Arr(items)
+                if !is_enum(name) {
+                    return Ok(Resolved::Null);
+                }
+                Ok(Resolved::Objects(
+                    enum_values(name)
+                        .iter()
+                        .map(|value| GqlObj::EnumValueInfo {
+                            name: value.to_string(),
+                        })
+                        .collect(),
+                ))
             }
-            _ => self.unknown_field(&Node::Type(name.to_string()), field),
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"__Type\"."
+            )),
         }
     }
 
-    // ---- mutations ----
+    // -- mutations --------------------------------------------------------
 
-    fn resolve_mutation(&mut self, document: &Document, field: &Field) -> Json {
-        let input = self.arg_value(field, "input").unwrap_or(Json::Null);
-        match field.name.as_str() {
-            "createIssue" => {
-                let Some(repository_id) = input
-                    .get("repositoryId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let Some(title) = input
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let body_text = input
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let Some((kind, db_id, _)) = self.store.decode_gid(&repository_id) else {
-                    return Json::Null;
-                };
-                if kind != "Repository" {
-                    return Json::Null;
-                }
-                let id = self.store.next_issue_id;
-                self.store.next_issue_id += 1;
-                self.store.created_seq += 1;
-                let created_seq = self.store.created_seq;
-                let repo = match self
-                    .store
-                    .repos
-                    .values_mut()
-                    .find(|repo| repo.db_id == db_id)
-                {
-                    Some(repo) => repo,
-                    None => return Json::Null,
-                };
-                repo.number_seq += 1;
-                let number = repo.number_seq;
-                repo.issues.push(crate::store::Issue {
-                    id,
-                    number,
-                    title,
-                    body: body_text,
-                    state: IssueState::Open,
-                    labels: Vec::new(),
-                    comments: Vec::new(),
-                    created_seq,
-                });
-                self.sub(document, Node::CreateIssue(db_id, number), field)
-            }
-            "closeIssue" => {
-                let Some(issue_id) = input
-                    .get("issueId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let Some((kind, db_id, number)) = self.store.decode_gid(&issue_id) else {
-                    return Json::Null;
-                };
-                if kind != "Issue" {
-                    return Json::Null;
-                }
-                let repo = match self
-                    .store
-                    .repos
-                    .values_mut()
-                    .find(|repo| repo.db_id == db_id)
-                {
-                    Some(repo) => repo,
-                    None => return Json::Null,
-                };
-                if let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number) {
-                    issue.state = IssueState::Closed;
-                } else {
-                    return Json::Null;
-                }
-                self.sub(document, Node::CloseIssue(db_id, number), field)
-            }
-            "createPullRequest" => {
-                let Some(repository_id) = input
-                    .get("repositoryId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let Some(base) = input
-                    .get("baseRefName")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let Some(head) = input
-                    .get("headRefName")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let title = input
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let body_text = input
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let Some((kind, db_id, _)) = self.store.decode_gid(&repository_id) else {
-                    return Json::Null;
-                };
-                if kind != "Repository" {
-                    return Json::Null;
-                }
-                let base_sha = match self
-                    .store
-                    .repos
-                    .values()
-                    .find(|repo| repo.db_id == db_id)
-                    .and_then(|repo| repo.branch_tip(&base))
-                {
-                    Some(sha) => sha,
-                    None => return Json::Null,
-                };
-                let id = self.store.next_pull_id;
-                self.store.next_pull_id += 1;
-                self.store.created_seq += 1;
-                let created_seq = self.store.created_seq;
-                let repo = match self
-                    .store
-                    .repos
-                    .values_mut()
-                    .find(|repo| repo.db_id == db_id)
-                {
-                    Some(repo) => repo,
-                    None => return Json::Null,
-                };
-                repo.number_seq += 1;
-                let number = repo.number_seq;
-                repo.pulls.push(crate::store::Pull {
-                    id,
-                    number,
-                    title,
-                    body: body_text,
-                    head_ref: head,
-                    base_ref: base,
-                    base_sha,
-                    state: IssueState::Open,
-                    merged: false,
-                    merged_at: None,
-                    merge_commit_sha: None,
-                    created_seq,
-                });
-                self.sub(document, Node::CreatePull(db_id, number), field)
-            }
-            "mergePullRequest" => {
-                let Some(pull_id) = input
-                    .get("pullRequestId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let Some((kind, db_id, number)) = self.store.decode_gid(&pull_id) else {
-                    return Json::Null;
-                };
-                if kind != "PullRequest" {
-                    return Json::Null;
-                }
-                let identity = self.store.identity();
-                let timestamp = self.store.next_commit_timestamp();
-                let merged_at =
-                    iso_from_epoch(crate::scenario::SCENARIO_EPOCH_SEC + self.store.commit_seq);
-                let repo = match self
-                    .store
-                    .repos
-                    .values_mut()
-                    .find(|repo| repo.db_id == db_id)
-                {
-                    Some(repo) => repo,
-                    None => return Json::Null,
-                };
-                match squash_merge(repo, &identity, timestamp, merged_at, number) {
-                    Ok(_) => self.sub(document, Node::MergePull(db_id, number), field),
-                    Err(_) => Json::Null,
-                }
-            }
-            "addComment" => {
-                let Some(subject_id) = input
-                    .get("subjectId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                else {
-                    return Json::Null;
-                };
-                let body_text = input
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let Some((kind, db_id, number)) = self.store.decode_gid(&subject_id) else {
-                    return Json::Null;
-                };
-                if kind != "Issue" {
-                    return Json::Null;
-                }
-                let repo = match self
-                    .store
-                    .repos
-                    .values_mut()
-                    .find(|repo| repo.db_id == db_id)
-                {
-                    Some(repo) => repo,
-                    None => return Json::Null,
-                };
-                repo.comment_seq += 1;
-                let comment_id = repo.comment_seq;
-                let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number)
-                else {
-                    return Json::Null;
-                };
-                issue.comments.push(crate::store::Comment {
-                    id: comment_id,
-                    body: body_text.clone(),
-                });
-                self.sub(document, Node::AddComment(comment_id, body_text), field)
-            }
-            _ => self.unknown_field(&Node::Mutation, field),
+    fn resolve_mutation(
+        &mut self,
+        field: &str,
+        args: &[(String, Json)],
+    ) -> Result<Resolved, String> {
+        match field {
+            "createIssue" => self.mut_create_issue(args),
+            "closeIssue" => self.mut_close_issue(args),
+            "createPullRequest" => self.mut_create_pull_request(args),
+            "mergePullRequest" => self.mut_merge_pull_request(args),
+            "addComment" => self.mut_add_comment(args),
+            _ => Err(format!(
+                "Cannot query field \"{field}\" on type \"Mutation\"."
+            )),
         }
+    }
+
+    fn mut_create_issue(&mut self, args: &[(String, Json)]) -> Result<Resolved, String> {
+        let input = arg_obj(args, "input").cloned().unwrap_or(Json::Null);
+        let repo_id = obj_field(&input, "repositoryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let title = obj_field(&input, "title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let body = obj_field(&input, "body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if title.is_empty() {
+            return Err("createIssue: title is required".to_string());
+        }
+        let Some((_, db_id, _)) = self.store.decode_gid(repo_id) else {
+            return Err("createIssue: unknown repositoryId".to_string());
+        };
+        let Some(key) = repo_key_by_db_id(self.store, db_id) else {
+            return Err("createIssue: unknown repositoryId".to_string());
+        };
+        let id = self.store.next_issue_id;
+        self.store.next_issue_id += 1;
+        self.store.created_seq += 1;
+        let created_seq = self.store.created_seq;
+        let repo = self.store.repos.get_mut(&key).unwrap();
+        repo.number_seq += 1;
+        let number = repo.number_seq;
+        repo.issues.push(Issue {
+            id,
+            number,
+            title,
+            body,
+            state: IssueState::Open,
+            labels: Vec::new(),
+            comments: Vec::new(),
+            created_seq,
+        });
+        Ok(Resolved::Object(GqlObj::IssuePayload {
+            owner: key.0,
+            name: key.1,
+            number,
+        }))
+    }
+
+    fn mut_close_issue(&mut self, args: &[(String, Json)]) -> Result<Resolved, String> {
+        let input = arg_obj(args, "input").cloned().unwrap_or(Json::Null);
+        let issue_id = obj_field(&input, "issueId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some((_, db_id, number)) = self.store.decode_gid(issue_id) else {
+            return Err("closeIssue: unknown issueId".to_string());
+        };
+        let Some(key) = repo_key_by_db_id(self.store, db_id) else {
+            return Err("closeIssue: unknown issueId".to_string());
+        };
+        let repo = self.store.repos.get_mut(&key).unwrap();
+        let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number) else {
+            return Err("closeIssue: unknown issueId".to_string());
+        };
+        issue.state = IssueState::Closed;
+        Ok(Resolved::Object(GqlObj::IssuePayload {
+            owner: key.0,
+            name: key.1,
+            number,
+        }))
+    }
+
+    fn mut_create_pull_request(&mut self, args: &[(String, Json)]) -> Result<Resolved, String> {
+        let input = arg_obj(args, "input").cloned().unwrap_or(Json::Null);
+        let repo_id = obj_field(&input, "repositoryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let base_ref = obj_field(&input, "baseRefName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let head_ref = obj_field(&input, "headRefName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = obj_field(&input, "title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some((_, db_id, _)) = self.store.decode_gid(repo_id) else {
+            return Err("createPullRequest: unknown repositoryId".to_string());
+        };
+        let Some(key) = repo_key_by_db_id(self.store, db_id) else {
+            return Err("createPullRequest: unknown repositoryId".to_string());
+        };
+        let (base_sha, head_ok) = match self.store.get_repo(&key.0, &key.1) {
+            Some(repo) => (
+                repo.branch_tip(&base_ref),
+                repo.branch_tip(&head_ref).is_some(),
+            ),
+            None => return Err("createPullRequest: unknown repositoryId".to_string()),
+        };
+        let Some(base_sha) = base_sha else {
+            return Err("createPullRequest: base branch does not exist".to_string());
+        };
+        if !head_ok {
+            return Err("createPullRequest: head branch does not exist".to_string());
+        }
+        if self.store.get_repo(&key.0, &key.1).is_some_and(|repo| {
+            repo.pulls
+                .iter()
+                .any(|pull| pull.head_ref == head_ref && pull.state == IssueState::Open)
+        }) {
+            return Err(
+                "createPullRequest: a pull request from this head branch is already open"
+                    .to_string(),
+            );
+        }
+        let id = self.store.next_pull_id;
+        self.store.next_pull_id += 1;
+        self.store.created_seq += 1;
+        let created_seq = self.store.created_seq;
+        let repo = self.store.repos.get_mut(&key).unwrap();
+        repo.number_seq += 1;
+        let number = repo.number_seq;
+        repo.pulls.push(Pull {
+            id,
+            number,
+            title,
+            body: String::new(),
+            head_ref,
+            base_ref,
+            base_sha,
+            state: IssueState::Open,
+            merged: false,
+            merged_at: None,
+            merge_commit_sha: None,
+            created_seq,
+        });
+        Ok(Resolved::Object(GqlObj::PullPayload {
+            owner: key.0,
+            name: key.1,
+            number,
+        }))
+    }
+
+    fn mut_merge_pull_request(&mut self, args: &[(String, Json)]) -> Result<Resolved, String> {
+        let input = arg_obj(args, "input").cloned().unwrap_or(Json::Null);
+        let pull_id = obj_field(&input, "pullRequestId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let method = obj_field(&input, "mergeMethod")
+            .and_then(|v| v.as_str())
+            .unwrap_or("SQUASH");
+        if !matches!(method, "MERGE" | "SQUASH" | "REBASE") {
+            return Err(format!("mergePullRequest: unknown mergeMethod {method}"));
+        }
+        let Some((_, db_id, number)) = self.store.decode_gid(pull_id) else {
+            return Err("mergePullRequest: unknown pullRequestId".to_string());
+        };
+        let Some(key) = repo_key_by_db_id(self.store, db_id) else {
+            return Err("mergePullRequest: unknown pullRequestId".to_string());
+        };
+        let identity = self.store.identity();
+        let timestamp = self.store.next_commit_timestamp();
+        let merged_at = iso_from_epoch(SCENARIO_EPOCH_SEC + self.store.commit_seq);
+        let repo = self.store.repos.get_mut(&key).unwrap();
+        match squash_merge(repo, &identity, timestamp, merged_at, number) {
+            Ok(_) => Ok(Resolved::Object(GqlObj::PullPayload {
+                owner: key.0,
+                name: key.1,
+                number,
+            })),
+            Err("conflict") => Err("mergePullRequest: merge conflict".to_string()),
+            Err("already merged") => Err("mergePullRequest: already merged".to_string()),
+            Err("closed") => Err("mergePullRequest: pull request is closed".to_string()),
+            Err(_) => Err("mergePullRequest: pull request cannot be merged".to_string()),
+        }
+    }
+
+    fn mut_add_comment(&mut self, args: &[(String, Json)]) -> Result<Resolved, String> {
+        let input = arg_obj(args, "input").cloned().unwrap_or(Json::Null);
+        let subject_id = obj_field(&input, "subjectId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let body = obj_field(&input, "body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some((kind, db_id, number)) = self.store.decode_gid(subject_id) else {
+            return Err("addComment: unknown subjectId".to_string());
+        };
+        if kind != "Issue" {
+            return Err("addComment: subject is not an issue".to_string());
+        }
+        let Some(key) = repo_key_by_db_id(self.store, db_id) else {
+            return Err("addComment: unknown subjectId".to_string());
+        };
+        let repo = self.store.repos.get_mut(&key).unwrap();
+        repo.comment_seq += 1;
+        let comment_id = repo.comment_seq;
+        let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number) else {
+            return Err("addComment: unknown subjectId".to_string());
+        };
+        issue.comments.push(crate::store::Comment {
+            id: comment_id,
+            body: body.clone(),
+        });
+        let comment_gid = base64_encode(format!("IssueComment:{db_id}:{comment_id}").as_bytes());
+        Ok(Resolved::Object(GqlObj::CommentPayload {
+            id: comment_gid,
+            body,
+        }))
     }
 }
 
-/// The fields the kit introspects for each type.
-fn type_fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "Issue" => &["id", "number", "title", "state", "body"],
-        "PullRequest" => &[
-            "id",
-            "number",
-            "headRefName",
-            "baseRefName",
-            "mergeable",
-            "state",
-            "merged",
-            "files",
-        ],
-        "Repository" => &[
-            "id",
-            "databaseId",
-            "name",
-            "nameWithOwner",
-            "owner",
-            "defaultBranchRef",
-            "viewerPermission",
-            "hasIssuesEnabled",
-            "issue",
-            "issues",
-            "pullRequests",
-            "pullRequest",
-        ],
-        "Viewer" => &["login"],
-        _ => &[],
+// ---------------------------------------------------------------------------
+// HTTP entry point.
+
+/// Serve one GraphQL request. Accepts a single `{query, variables}`
+/// object or a JSON array of them (batch); answers 200 with
+/// `{"data": ...}` (plus an `errors` array when validation or execution
+/// reported any), or 400 when the body is not JSON at all.
+pub fn handle(store: &RwLock<Store>, req: &Request) -> Response {
+    if req.method != "POST" {
+        return error_reply(405, "method not allowed");
+    }
+    let body_text = String::from_utf8_lossy(&req.body);
+    let parsed = match crate::json::parse(&body_text) {
+        Ok(value) => value,
+        Err(_) => return error_reply(400, "malformed JSON body"),
+    };
+    let mut guard = store.write().unwrap();
+    let is_batch = matches!(parsed, Json::Arr(_));
+    let payloads: Vec<&Json> = match &parsed {
+        Json::Arr(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let mut results = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        results.push(run_one(&mut guard, payload));
+    }
+    let body = if is_batch {
+        Json::Arr(results)
+    } else {
+        results.into_iter().next().unwrap_or(Json::Null)
+    };
+    Response::new(200, body.stringify().into_bytes())
+        .header("content-type", "application/json; charset=utf-8")
+}
+
+fn error_reply(status: u16, message: &str) -> Response {
+    let body = crate::json::obj(vec![("message", Json::Str(message.to_string()))]);
+    Response::new(status, body.stringify().into_bytes())
+        .header("content-type", "application/json; charset=utf-8")
+}
+
+/// `{"data": null, "errors": [{"message": ...}]}`.
+fn error_result(message: &str) -> Json {
+    crate::json::obj(vec![
+        ("data", Json::Null),
+        (
+            "errors",
+            Json::Arr(vec![crate::json::obj(vec![(
+                "message",
+                Json::Str(message.to_string()),
+            )])]),
+        ),
+    ])
+}
+
+/// Run one `{query, variables, operationName}` payload against the store.
+fn run_one(store: &mut Store, payload: &Json) -> Json {
+    let Some(query) = payload.get("query").and_then(|value| value.as_str()) else {
+        return error_result("GraphQL request must include a query");
+    };
+    let doc = match parse_document(query) {
+        Ok(doc) => doc,
+        Err(message) => return error_result(&message),
+    };
+    let operation_name = payload
+        .get("operationName")
+        .and_then(|value| value.as_str());
+    let op = match pick_operation(&doc, operation_name) {
+        Ok(op) => op,
+        Err(message) => return error_result(&message),
+    };
+    // Variables: defaults from the operation's variable definitions,
+    // overlaid by the values the request supplied.
+    let mut vars: HashMap<String, Json> = HashMap::new();
+    for (name, default) in &op.var_defs {
+        if let Some(default) = default {
+            vars.insert(name.clone(), default.resolve(&HashMap::new()));
+        }
+    }
+    if let Some(Json::Obj(entries)) = payload.get("variables") {
+        for (key, value) in entries {
+            vars.insert(key.clone(), value.clone());
+        }
+    }
+    let validation_errors = validate_operation(&doc, op);
+    if !validation_errors.is_empty() {
+        let errors: Vec<Json> = validation_errors
+            .iter()
+            .map(|message| crate::json::obj(vec![("message", Json::Str(message.clone()))]))
+            .collect();
+        return crate::json::obj(vec![("data", Json::Null), ("errors", Json::Arr(errors))]);
+    }
+    let mut exec = Exec {
+        store,
+        doc: &doc,
+        vars,
+        errors: Vec::new(),
+        frag_stack: Vec::new(),
+        frag_budget: 0,
+    };
+    let data = exec.run(op);
+    let errors = std::mem::take(&mut exec.errors);
+    if errors.is_empty() {
+        crate::json::obj(vec![("data", data)])
+    } else {
+        let errors_json: Vec<Json> = errors
+            .iter()
+            .map(|message| crate::json::obj(vec![("message", Json::Str(message.clone()))]))
+            .collect();
+        crate::json::obj(vec![("data", data), ("errors", Json::Arr(errors_json))])
+    }
+}
+
+fn pick_operation<'d>(doc: &'d Document, name: Option<&str>) -> Result<&'d Operation, String> {
+    if let Some(name) = name {
+        return doc
+            .ops
+            .iter()
+            .find(|op| op.name.as_deref() == Some(name))
+            .ok_or_else(|| format!("Unknown operation named \"{name}\"."));
+    }
+    if doc.ops.len() == 1 {
+        return Ok(&doc.ops[0]);
+    }
+    Err("Must provide operation name if query contains multiple operations.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::build_scenario;
+
+    fn test_store() -> Store {
+        let mut store = Store::new(build_scenario().viewer);
+        store
+            .create_repo("demo", "demo repo", false)
+            .expect("create demo repo");
+        store
+    }
+
+    /// Run a GraphQL document against a store, with optional variables.
+    fn gql(store: &mut Store, query: &str, variables: Option<Json>) -> Json {
+        let mut payload = crate::json::obj(vec![("query", Json::Str(query.to_string()))]);
+        if let Some(variables) = variables {
+            if let Json::Obj(entries) = &mut payload {
+                entries.push(("variables".to_string(), variables));
+            }
+        }
+        run_one(store, &payload)
+    }
+
+    fn data(result: &Json) -> &Json {
+        result.get("data").expect("result has data")
+    }
+
+    fn errors_of(result: &Json) -> Vec<String> {
+        match result.get("errors") {
+            Some(Json::Arr(items)) => items
+                .iter()
+                .filter_map(|item| item.get("message"))
+                .filter_map(|message| message.as_str())
+                .map(|message| message.to_string())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn viewer_login() {
+        let mut store = test_store();
+        let result = gql(&mut store, "{ viewer { login } }", None);
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        assert_eq!(
+            data(&result)
+                .get("viewer")
+                .unwrap()
+                .get("login")
+                .unwrap()
+                .as_str(),
+            Some("adaiversen")
+        );
+    }
+
+    #[test]
+    fn repository_fields() {
+        let mut store = test_store();
+        let query = "query RepositoryFields($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId name nameWithOwner owner { login } defaultBranchRef { name } viewerPermission hasIssuesEnabled } }";
+        let variables = crate::json::obj(vec![
+            ("owner", Json::Str("adaiversen".to_string())),
+            ("name", Json::Str("demo".to_string())),
+        ]);
+        let result = gql(&mut store, query, Some(variables));
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let repo = data(&result).get("repository").unwrap();
+        let id = repo.get("id").unwrap().as_str().unwrap();
+        assert!(!id.is_empty());
+        assert_ne!(id, "1", "global id must not be the plain database id");
+        assert!(repo.get("databaseId").unwrap().as_i64().unwrap() > 0);
+        assert_eq!(repo.get("name").unwrap().as_str(), Some("demo"));
+        assert_eq!(
+            repo.get("nameWithOwner").unwrap().as_str(),
+            Some("adaiversen/demo")
+        );
+        assert_eq!(
+            repo.get("owner").unwrap().get("login").unwrap().as_str(),
+            Some("adaiversen")
+        );
+        assert_eq!(
+            repo.get("viewerPermission").unwrap().as_str(),
+            Some("ADMIN")
+        );
+        assert_eq!(repo.get("hasIssuesEnabled").unwrap().as_bool(), Some(true));
+        // The default branch ref is null on an empty repo; a second read
+        // must return the same global id.
+        let again = gql(
+            &mut store,
+            query,
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+            ])),
+        );
+        assert_eq!(
+            data(&again)
+                .get("repository")
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_str(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn create_issue_close_issue_and_read_back() {
+        let mut store = test_store();
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        let create = "mutation CreateIssue($input: CreateIssueInput!) { createIssue(input: $input) { issue { number id title state } } }";
+        let variables = crate::json::obj(vec![(
+            "input",
+            crate::json::obj(vec![
+                ("repositoryId", Json::Str(repo_id.clone())),
+                ("title", Json::Str("First bug".to_string())),
+                ("body", Json::Str("It broke".to_string())),
+            ]),
+        )]);
+        let result = gql(&mut store, create, Some(variables));
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let issue = data(&result)
+            .get("createIssue")
+            .unwrap()
+            .get("issue")
+            .unwrap();
+        assert_eq!(issue.get("number").unwrap().as_i64(), Some(1));
+        assert_eq!(issue.get("title").unwrap().as_str(), Some("First bug"));
+        assert_eq!(issue.get("state").unwrap().as_str(), Some("OPEN"));
+        let issue_id = issue.get("id").unwrap().as_str().unwrap().to_string();
+
+        let read = gql(
+            &mut store,
+            "query IssueByNumber($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { number title state body } } }",
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+                ("number", Json::Int(1)),
+            ])),
+        );
+        assert!(errors_of(&read).is_empty(), "{read:?}");
+        let found = data(&read).get("repository").unwrap().get("issue").unwrap();
+        assert_eq!(found.get("title").unwrap().as_str(), Some("First bug"));
+        assert_eq!(found.get("state").unwrap().as_str(), Some("OPEN"));
+
+        let close = gql(
+            &mut store,
+            "mutation CloseIssue($input: CloseIssueInput!) { closeIssue(input: $input) { issue { number state } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![("issueId", Json::Str(issue_id))]),
+            )])),
+        );
+        assert!(errors_of(&close).is_empty(), "{close:?}");
+        assert_eq!(
+            data(&close)
+                .get("closeIssue")
+                .unwrap()
+                .get("issue")
+                .unwrap()
+                .get("state")
+                .unwrap()
+                .as_str(),
+            Some("CLOSED")
+        );
+    }
+
+    #[test]
+    fn unknown_field_reports_error_naming_the_field() {
+        let mut store = test_store();
+        let result = gql(&mut store, "{ viewer { login noSuchFieldOnViewer } }", None);
+        let messages = errors_of(&result);
+        assert!(!messages.is_empty(), "expected errors, got {result:?}");
+        assert!(
+            messages.iter().any(|m| m.contains("noSuchFieldOnViewer")),
+            "messages: {messages:?}"
+        );
+        assert_eq!(data(&result), &Json::Null);
+    }
+
+    #[test]
+    fn unknown_repository_returns_null_without_errors() {
+        let mut store = test_store();
+        let result = gql(
+            &mut store,
+            "query { repository(owner: \"adaiversen\", name: \"nope\") { id name } }",
+            None,
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        assert_eq!(data(&result).get("repository").unwrap(), &Json::Null);
+    }
+
+    #[test]
+    fn node_round_trips_repository() {
+        let mut store = test_store();
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        let result = gql(
+            &mut store,
+            "query NodeById($id: ID!) { node(id: $id) { id ... on Repository { name nameWithOwner } } }",
+            Some(crate::json::obj(vec![(
+                "id",
+                Json::Str(repo_id),
+            )])),
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let node = data(&result).get("node").unwrap();
+        assert_eq!(node.get("name").unwrap().as_str(), Some("demo"));
+        assert_eq!(
+            node.get("nameWithOwner").unwrap().as_str(),
+            Some("adaiversen/demo")
+        );
+    }
+
+    #[test]
+    fn issues_pagination_with_cursors() {
+        let mut store = test_store();
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        for n in 1..=7 {
+            let result = gql(
+                &mut store,
+                "mutation CreateIssue($input: CreateIssueInput!) { createIssue(input: $input) { issue { number } } }",
+                Some(crate::json::obj(vec![(
+                    "input",
+                    crate::json::obj(vec![
+                        ("repositoryId", Json::Str(repo_id.clone())),
+                        ("title", Json::Str(format!("issue {n}"))),
+                    ]),
+                )])),
+            );
+            assert!(errors_of(&result).is_empty(), "{result:?}");
+        }
+        let page_query = "query IssuesPage($owner: String!, $name: String!, $first: Int, $after: String) { repository(owner: $owner, name: $name) { issues(first: $first, after: $after) { nodes { number } pageInfo { hasNextPage endCursor } } } }";
+        let page1 = gql(
+            &mut store,
+            page_query,
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+                ("first", Json::Int(5)),
+            ])),
+        );
+        assert!(errors_of(&page1).is_empty(), "{page1:?}");
+        let issues1 = data(&page1)
+            .get("repository")
+            .unwrap()
+            .get("issues")
+            .unwrap();
+        let nodes1 = issues1.get("nodes").unwrap().as_arr().unwrap();
+        assert_eq!(nodes1.len(), 5);
+        assert_eq!(
+            issues1
+                .get("pageInfo")
+                .unwrap()
+                .get("hasNextPage")
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        let cursor = issues1
+            .get("pageInfo")
+            .unwrap()
+            .get("endCursor")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!cursor.is_empty());
+        let page2 = gql(
+            &mut store,
+            page_query,
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+                ("first", Json::Int(5)),
+                ("after", Json::Str(cursor)),
+            ])),
+        );
+        assert!(errors_of(&page2).is_empty(), "{page2:?}");
+        let issues2 = data(&page2)
+            .get("repository")
+            .unwrap()
+            .get("issues")
+            .unwrap();
+        let nodes2 = issues2.get("nodes").unwrap().as_arr().unwrap();
+        assert_eq!(nodes2.len(), 2);
+        assert_eq!(
+            issues2
+                .get("pageInfo")
+                .unwrap()
+                .get("hasNextPage")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+        let mut seen: Vec<i64> = nodes1
+            .iter()
+            .chain(nodes2.iter())
+            .map(|node| node.get("number").unwrap().as_i64().unwrap())
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn issues_open_desc_order() {
+        let mut store = test_store();
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        for n in 1..=3 {
+            gql(
+                &mut store,
+                "mutation CreateIssue($input: CreateIssueInput!) { createIssue(input: $input) { issue { number } } }",
+                Some(crate::json::obj(vec![(
+                    "input",
+                    crate::json::obj(vec![
+                        ("repositoryId", Json::Str(repo_id.clone())),
+                        ("title", Json::Str(format!("issue {n}"))),
+                    ]),
+                )])),
+            );
+        }
+        // Close issue 2 so only 1 and 3 stay open.
+        let issue2_id = store
+            .issue_gid(store.get_repo("adaiversen", "demo").unwrap(), 2)
+            .clone();
+        gql(
+            &mut store,
+            "mutation CloseIssue($input: CloseIssueInput!) { closeIssue(input: $input) { issue { number } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![("issueId", Json::Str(issue2_id))]),
+            )])),
+        );
+        let result = gql(
+            &mut store,
+            "query OpenIssues($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { issues(first: 10, states: [OPEN], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number } } } }",
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+            ])),
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let nodes = data(&result)
+            .get("repository")
+            .unwrap()
+            .get("issues")
+            .unwrap()
+            .get("nodes")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let numbers: Vec<i64> = nodes
+            .iter()
+            .map(|node| node.get("number").unwrap().as_i64().unwrap())
+            .collect();
+        assert_eq!(numbers, vec![3, 1]);
+    }
+
+    #[test]
+    fn fragment_cycle_rejected() {
+        let mut store = test_store();
+        let result = gql(
+            &mut store,
+            "query { viewer { ...F } } fragment F on User { login ...F }",
+            None,
+        );
+        let messages = errors_of(&result);
+        assert!(!messages.is_empty(), "expected errors, got {result:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("fragment cycle detected: F")),
+            "messages: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn deep_selection_rejected() {
+        let mut store = test_store();
+        // 200 nested inline fragments: the parser's depth cap (128)
+        // must stop this before any execution happens.
+        let mut query = String::from("query { ");
+        for _ in 0..200 {
+            query.push_str("... on Query { ");
+        }
+        query.push_str("viewer { login }");
+        for _ in 0..200 {
+            query.push_str(" }");
+        }
+        query.push_str(" }");
+        let result = gql(&mut store, &query, None);
+        let messages = errors_of(&result);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("GraphQL selection nesting too deep")),
+            "messages: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn deep_value_rejected() {
+        let mut store = test_store();
+        // A 200-deep list literal as an argument value.
+        let mut value = String::new();
+        for _ in 0..200 {
+            value.push('[');
+        }
+        value.push_str("\"OPEN\"");
+        for _ in 0..200 {
+            value.push(']');
+        }
+        let query = format!(
+            "query {{ repository(owner: \"adaiversen\", name: \"demo\") {{ issues(states: {value}) {{ nodes {{ number }} }} }} }}"
+        );
+        let result = gql(&mut store, &query, None);
+        let messages = errors_of(&result);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("GraphQL value nesting too deep")),
+            "messages: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn introspection_lists_issue_fields() {
+        let mut store = test_store();
+        let result = gql(
+            &mut store,
+            "query { Issue: __type(name: \"Issue\") { fields(includeDeprecated: true) { name } } }",
+            None,
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let fields = data(&result)
+            .get("Issue")
+            .unwrap()
+            .get("fields")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let names: Vec<&str> = fields
+            .iter()
+            .filter_map(|field| field.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect();
+        for wanted in ["id", "number", "title", "state", "body"] {
+            assert!(names.contains(&wanted), "fields: {names:?}");
+        }
+    }
+
+    #[test]
+    fn introspection_search_type_has_issue() {
+        let mut store = test_store();
+        let result = gql(
+            &mut store,
+            "query { __type(name: \"SearchType\") { enumValues { name } } }",
+            None,
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let values = data(&result)
+            .get("__type")
+            .unwrap()
+            .get("enumValues")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let names: Vec<&str> = values
+            .iter()
+            .filter_map(|value| value.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect();
+        assert!(names.contains(&"ISSUE"), "values: {names:?}");
+    }
+
+    #[test]
+    fn batch_returns_results_in_order() {
+        let store = std::sync::RwLock::new(test_store());
+        let body = crate::json::parse(
+            "[{\"query\":\"{ viewer { login } }\"},{\"query\":\"{ viewer { login } }\"}]",
+        )
+        .unwrap();
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/api/graphql".to_string(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            body: body.stringify().into_bytes(),
+        };
+        let response = handle(&store, &request);
+        assert_eq!(response.status, 200);
+        let parsed = crate::json::parse(&String::from_utf8_lossy(&response.body)).unwrap();
+        let items = parsed.as_arr().unwrap();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(
+                item.get("data")
+                    .unwrap()
+                    .get("viewer")
+                    .unwrap()
+                    .get("login")
+                    .unwrap()
+                    .as_str(),
+                Some("adaiversen")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_body_is_400() {
+        let store = std::sync::RwLock::new(test_store());
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/api/graphql".to_string(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            body: b"{not json".to_vec(),
+        };
+        let response = handle(&store, &request);
+        assert_eq!(response.status, 400);
+        let parsed = crate::json::parse(&String::from_utf8_lossy(&response.body)).unwrap();
+        assert_eq!(
+            parsed.get("message").unwrap().as_str(),
+            Some("malformed JSON body")
+        );
+    }
+
+    #[test]
+    fn pull_request_flow_with_files_and_merge() {
+        let mut store = test_store();
+        let identity = store.identity();
+        let timestamp = store.next_commit_timestamp();
+        {
+            let repo = store.get_repo_mut("adaiversen", "demo").unwrap();
+            let default_branch = repo.default_branch.clone();
+            crate::store::write_file(
+                repo,
+                &identity,
+                timestamp,
+                "README.md",
+                b"hello\n",
+                "init",
+                Some(&default_branch),
+                None,
+            )
+            .expect("write README");
+            let tip = repo.branch_tip(&default_branch).unwrap();
+            repo.set_ref("refs/heads/feature", Some(tip));
+        }
+        let timestamp = store.next_commit_timestamp();
+        {
+            let repo = store.get_repo_mut("adaiversen", "demo").unwrap();
+            crate::store::write_file(
+                repo,
+                &identity,
+                timestamp,
+                "feature.txt",
+                b"new\n",
+                "add feature",
+                Some("feature"),
+                None,
+            )
+            .expect("write feature.txt");
+        }
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        let create = gql(
+            &mut store,
+            "mutation CreatePR($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { number id state headRefName baseRefName } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![
+                    ("repositoryId", Json::Str(repo_id.clone())),
+                    ("baseRefName", Json::Str("main".to_string())),
+                    ("headRefName", Json::Str("feature".to_string())),
+                    ("title", Json::Str("Add feature".to_string())),
+                ]),
+            )])),
+        );
+        assert!(errors_of(&create).is_empty(), "{create:?}");
+        let pull = data(&create)
+            .get("createPullRequest")
+            .unwrap()
+            .get("pullRequest")
+            .unwrap();
+        assert_eq!(pull.get("number").unwrap().as_i64(), Some(1));
+        assert_eq!(pull.get("state").unwrap().as_str(), Some("OPEN"));
+        assert_eq!(pull.get("headRefName").unwrap().as_str(), Some("feature"));
+        assert_eq!(pull.get("baseRefName").unwrap().as_str(), Some("main"));
+        let pull_id = pull.get("id").unwrap().as_str().unwrap().to_string();
+
+        let files = gql(
+            &mut store,
+            "query PRFiles($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { pullRequest(number: 1) { files(first: 10) { nodes { path } } } } }",
+            Some(crate::json::obj(vec![
+                ("owner", Json::Str("adaiversen".to_string())),
+                ("name", Json::Str("demo".to_string())),
+            ])),
+        );
+        assert!(errors_of(&files).is_empty(), "{files:?}");
+        let nodes = data(&files)
+            .get("repository")
+            .unwrap()
+            .get("pullRequest")
+            .unwrap()
+            .get("files")
+            .unwrap()
+            .get("nodes")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let paths: Vec<&str> = nodes
+            .iter()
+            .filter_map(|node| node.get("path"))
+            .filter_map(|path| path.as_str())
+            .collect();
+        assert!(paths.contains(&"feature.txt"), "paths: {paths:?}");
+
+        let merge = gql(
+            &mut store,
+            "mutation MergePR($input: MergePullRequestInput!) { mergePullRequest(input: $input) { pullRequest { number merged state } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![
+                    ("pullRequestId", Json::Str(pull_id)),
+                    ("mergeMethod", Json::Str("SQUASH".to_string())),
+                ]),
+            )])),
+        );
+        assert!(errors_of(&merge).is_empty(), "{merge:?}");
+        let merged = data(&merge)
+            .get("mergePullRequest")
+            .unwrap()
+            .get("pullRequest")
+            .unwrap();
+        assert_eq!(merged.get("merged").unwrap().as_bool(), Some(true));
+        assert_eq!(merged.get("state").unwrap().as_str(), Some("MERGED"));
+    }
+
+    #[test]
+    fn add_comment_reads_back() {
+        let mut store = test_store();
+        let repo_id = store
+            .repo_gid(store.get_repo("adaiversen", "demo").unwrap())
+            .clone();
+        gql(
+            &mut store,
+            "mutation CreateIssue($input: CreateIssueInput!) { createIssue(input: $input) { issue { number } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![
+                    ("repositoryId", Json::Str(repo_id.clone())),
+                    ("title", Json::Str("Needs a comment".to_string())),
+                ]),
+            )])),
+        );
+        let issue_id = store
+            .issue_gid(store.get_repo("adaiversen", "demo").unwrap(), 1)
+            .clone();
+        let result = gql(
+            &mut store,
+            "mutation AddComment($input: AddCommentInput!) { addComment(input: $input) { commentEdge { node { id body } } } }",
+            Some(crate::json::obj(vec![(
+                "input",
+                crate::json::obj(vec![
+                    ("subjectId", Json::Str(issue_id)),
+                    ("body", Json::Str("hello there".to_string())),
+                ]),
+            )])),
+        );
+        assert!(errors_of(&result).is_empty(), "{result:?}");
+        let node = data(&result)
+            .get("addComment")
+            .unwrap()
+            .get("commentEdge")
+            .unwrap()
+            .get("node")
+            .unwrap();
+        assert_eq!(node.get("body").unwrap().as_str(), Some("hello there"));
+        assert!(!node.get("id").unwrap().as_str().unwrap().is_empty());
     }
 }

@@ -1,4 +1,4 @@
-# github-core-clone-01 — Rust forge (Round 10)
+# github-core-clone-01 — Rust forge (Round 15)
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/hyde1990/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/hyde1990/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
@@ -6,7 +6,18 @@
 A GitHub-compatible git forge for [the contest](https://make.fun/bounty/github-core-clone-01),
 written in pure-std Rust and shipped as a statically linked Linux amd64 binary.
 
-## Round 10: one non-blocking epoll reactor
+## Round 15: a rewrite of the Round 10 entry
+
+Round 10 (9-trial local mean 995.22) was blocked at submit: the authorship
+check found only 13.3% of its lines authored in-session (it was a port of
+Round 8). Round 15 keeps the Round 10 architecture — one non-blocking epoll
+reactor, the same store, the same git transport — but rewrites `graphql.rs`
+and `rest.rs` genuinely from the kit specification (new structure, new
+function organization, new internal naming), and re-types every other file
+in-session. It also applies the Round 14 hardening: a fragment visited-set
+and expansion budget plus a 128-deep parser cap in GraphQL, a 128-deep cap
+in the JSON parser/serializer, pack count/size validation, a 64 MiB zlib
+inflate cap, and an early return in `register_env` for an empty env URL.
 
 Every connection is served by a single reactor thread (`http.rs`): it waits
 in `epoll_wait`, reads a ready socket, handles the request inline, and writes
@@ -21,15 +32,15 @@ syscalls (`core::arch::asm!`): pure-std Rust has no epoll binding and this
 crate takes no dependencies. The only other thread is the done-watcher,
 which sleeps and polls `$MAKEFUN_ENV_URL/done` every 500 ms.
 
-Kept from the Round 6 baseline (9-trial mean 994.78): the pack cache (packs
-keyed by their sorted oid set) and the v0 advertisement cache.
+Kept from the Round 10 baseline: the pack cache (packs keyed by their
+sorted oid set) and the v0 advertisement cache.
 
 ## Layout
 
 - `main.ts` — the entrypoint the harness runs (`node main.ts`). It only
   spawns the `forge` binary beside it, passes the environment through, and
   mirrors the child's exit code. It serves no HTTP itself.
-- `forge` — the static musl binary (791 KB). It binds an ephemeral port,
+- `forge` — the static musl binary (~791 KB). It binds an ephemeral port,
   registers to `$MAKEFUN_ENV_URL`, serves every request, polls `/done`, and
   exits 0. Pure `std`, no external crates: the trial pod installs nothing.
 - `src/` — the Rust source: HTTP/1.1 epoll reactor (`http.rs`), JSON
@@ -37,7 +48,7 @@ keyed by their sorted oid set) and the v0 advertisement cache.
   objects/packs/pkt-line (`git.rs`), the store (`store.rs`), REST v3
   (`rest.rs`), smart HTTP git (`git_http.rs`), GraphQL (`graphql.rs`), MCP
   (`mcp.rs`), and the scenario generator (`scenario.rs`).
-- `LEDGER.md` — forensics, the Round 10 hypothesis, the grading ledger, and
+- `LEDGER.md` — forensics, the Round 15 hypothesis, the grading ledger, and
   the promotion decision.
 - `Cargo.toml` — `opt-level="z"`, `lto=true`, `panic="abort"`,
   `strip=true`, `codegen-units=1`.

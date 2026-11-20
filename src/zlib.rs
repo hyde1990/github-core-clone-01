@@ -5,6 +5,15 @@
 //! fastest correct choice for the small objects this forge packs (the
 //! loopback does not care about a few hundred extra bytes, and the client
 //! inflates with Node's zlib either way).
+//!
+//! Round 15 hardening (C5): inflate output is capped at 64 MiB. A stream
+//! whose output would pass the cap fails with "inflate output exceeds
+//! limit" instead of growing a buffer without bound (a 48 KB pack can
+//! expand to 50 MB, and a crafted one to 200 MB). Legitimate objects are
+//! kilobytes; the cap is far above anything the suite pushes.
+
+/// The largest output `inflate` will produce (64 MiB).
+pub const MAX_INFLATE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Error text for a malformed stream.
 pub type ZlibError = &'static str;
@@ -332,6 +341,14 @@ impl<'a> Decoder<'a> {
         self.bits.consumed()
     }
 
+    /// Fail when `n` more output bytes would pass the inflate cap.
+    fn check_room(&mut self, n: usize) -> Result<(), ZlibError> {
+        if self.out.len() + n > MAX_INFLATE_BYTES {
+            return Err("inflate output exceeds limit");
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<Vec<u8>, ZlibError> {
         loop {
             let last = self.bits.bit() == 1;
@@ -366,6 +383,8 @@ impl<'a> Decoder<'a> {
         if len as u16 != !nlen {
             return Err("stored block length mismatch");
         }
+        // One check for the whole block: the total is what matters.
+        self.check_room(len)?;
         for _ in 0..len {
             let byte = self.bits.byte().ok_or("truncated stored block")?;
             self.out.push(byte);
@@ -437,7 +456,10 @@ impl<'a> Decoder<'a> {
         loop {
             let sym = lit.decode(&mut self.bits)?;
             match sym {
-                0..=255 => self.out.push(sym as u8),
+                0..=255 => {
+                    self.check_room(1)?;
+                    self.out.push(sym as u8);
+                }
                 256 => return Ok(()),
                 257..=285 => {
                     let idx = (sym - 257) as usize;
@@ -455,6 +477,7 @@ impl<'a> Decoder<'a> {
                     let mut from = self.out.len() - distance;
                     while remaining > 0 {
                         let chunk = remaining.min(distance);
+                        self.check_room(chunk)?;
                         self.out.extend_from_within(from..from + chunk);
                         remaining -= chunk;
                         from += chunk;
@@ -553,5 +576,21 @@ mod tests {
     fn adler_known() {
         assert_eq!(adler32(b""), 1);
         assert_eq!(adler32(b"abc"), 0x024d_0127);
+    }
+
+    #[test]
+    fn inflate_rejects_output_over_cap() {
+        // 65 MiB of stored blocks: must fail once output passes 64 MiB,
+        // with the cap error — not by growing a 65 MiB buffer.
+        let big = vec![0u8; MAX_INFLATE_BYTES + 1024 * 1024];
+        let err = inflate(&deflate(&big)).unwrap_err();
+        assert!(err.contains("exceeds limit"), "got: {err}");
+    }
+
+    #[test]
+    fn inflate_allows_exactly_at_cap() {
+        // Exactly 64 MiB round-trips: the cap is inclusive.
+        let big = vec![b'a'; MAX_INFLATE_BYTES];
+        assert_eq!(inflate(&deflate(&big)).unwrap(), big);
     }
 }

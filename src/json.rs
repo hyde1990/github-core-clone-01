@@ -2,6 +2,15 @@
 //!
 //! A number that looks like an integer parses as `Int`; anything with a
 //! fraction or an exponent parses as `Float`.
+//!
+//! Round 15 hardening (C3): both the parser and the serializer are
+//! depth-capped at 128. A body nested deeper than that is rejected with
+//! "JSON nesting too deep" instead of recursing until the stack dies, and
+//! a value serialized past the cap emits `null` for the over-deep subtree
+//! so the output stays valid JSON. Legitimate bodies nest at most ~6 deep.
+
+/// The deepest nesting the parser and the serializer accept.
+pub const MAX_JSON_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Json {
@@ -64,14 +73,15 @@ impl Json {
         }
     }
 
-    /// Compact serialization.
+    /// Compact serialization. A subtree past `MAX_JSON_DEPTH` is written
+    /// as `null` so the output stays valid JSON.
     pub fn stringify(&self) -> String {
         let mut out = String::new();
-        self.write(&mut out);
+        self.write(&mut out, 0);
         out
     }
 
-    fn write(&self, out: &mut String) {
+    fn write(&self, out: &mut String, depth: usize) {
         match self {
             Json::Null => out.push_str("null"),
             Json::Bool(true) => out.push_str("true"),
@@ -86,16 +96,24 @@ impl Json {
             }
             Json::Str(text) => write_json_string(out, text),
             Json::Arr(items) => {
+                if depth > MAX_JSON_DEPTH {
+                    out.push_str("null");
+                    return;
+                }
                 out.push('[');
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    item.write(out);
+                    item.write(out, depth + 1);
                 }
                 out.push(']');
             }
             Json::Obj(fields) => {
+                if depth > MAX_JSON_DEPTH {
+                    out.push_str("null");
+                    return;
+                }
                 out.push('{');
                 for (i, (key, value)) in fields.iter().enumerate() {
                     if i > 0 {
@@ -103,7 +121,7 @@ impl Json {
                     }
                     write_json_string(out, key);
                     out.push(':');
-                    value.write(out);
+                    value.write(out, depth + 1);
                 }
                 out.push('}');
             }
@@ -130,13 +148,14 @@ fn write_json_string(out: &mut String, text: &str) {
 }
 
 /// Parse a JSON document. Errors are plain text; callers map them to 400.
+/// A document nested deeper than `MAX_JSON_DEPTH` is rejected.
 pub fn parse(text: &str) -> Result<Json, String> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         pos: 0,
     };
     parser.skip_ws();
-    let value = parser.value()?;
+    let value = parser.value(0)?;
     parser.skip_ws();
     if parser.pos != parser.bytes.len() {
         return Err("trailing characters".to_string());
@@ -171,10 +190,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, String> {
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err("JSON nesting too deep".to_string());
+        }
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
@@ -196,7 +218,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<Json, String> {
+    fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.expect(b'{')?;
         let mut fields = Vec::new();
         self.skip_ws();
@@ -213,7 +235,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(b':')?;
             self.skip_ws();
-            let value = self.value()?;
+            let value = self.value(depth + 1)?;
             fields.push((key, value));
             self.skip_ws();
             match self.peek() {
@@ -227,7 +249,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn array(&mut self) -> Result<Json, String> {
+    fn array(&mut self, depth: usize) -> Result<Json, String> {
         self.expect(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -237,7 +259,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.skip_ws();
-            items.push(self.value()?);
+            items.push(self.value(depth + 1)?);
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -404,5 +426,48 @@ mod tests {
             parse(r#""\ud83d\ude00""#).unwrap().as_str().unwrap(),
             "\u{1F600}"
         );
+    }
+
+    #[test]
+    fn rejects_deep_nesting() {
+        // 200 nested arrays: must fail fast instead of recursing to a crash.
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let err = parse(&deep).unwrap_err();
+        assert!(err.contains("too deep"), "got: {err}");
+        // 200 nested objects likewise.
+        let mut obj = String::new();
+        for _ in 0..200 {
+            obj.push_str("{\"a\":");
+        }
+        obj.push('1');
+        for _ in 0..200 {
+            obj.push('}');
+        }
+        assert!(parse(&obj).is_err());
+        // Shallow nesting still parses.
+        assert!(parse("[[[[1]]]]").is_ok());
+    }
+
+    #[test]
+    fn stringify_caps_deep_values() {
+        // A 130-deep value serializes to valid JSON with the over-deep
+        // subtree replaced by null (it cannot round-trip through the
+        // 128-deep parser, by design).
+        let mut value = Json::Int(1);
+        for _ in 0..130 {
+            value = Json::Arr(vec![value]);
+        }
+        let text = value.stringify();
+        assert!(text.contains("null"));
+        // The output is still balanced JSON.
+        let mut depth = 0i32;
+        for ch in text.chars() {
+            match ch {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0);
     }
 }

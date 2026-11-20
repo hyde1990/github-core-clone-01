@@ -1,9 +1,16 @@
 //! forge: a GitHub-compatible git forge in pure-std Rust.
 //!
-//! Round 10: a single-threaded non-blocking epoll reactor serves every
-//! connection (see `http::serve`). The only other thread is the
-//! done-watcher, which sleeps and polls `$MAKEFUN_ENV_URL/done` every
-//! 500 ms; it never touches the store or the serving path.
+//! Round 15: a rewrite of the Round 10 entry (same reactor, same store,
+//! new GraphQL and REST layers written from the kit spec). A
+//! single-threaded non-blocking epoll reactor serves every connection
+//! (see `http::serve`). The only other thread is the done-watcher, which
+//! sleeps and polls `$MAKEFUN_ENV_URL/done` every 500 ms; it never
+//! touches the store or the serving path.
+//!
+//! Round 15 hardening: `register_env` returns at once when
+//! `MAKEFUN_ENV_URL` is set but empty (main.ts passes `""` when the
+//! variable is unset, and the old code spent ~15 s retrying a connect to
+//! an empty host before giving up).
 
 mod git;
 mod git_http;
@@ -30,6 +37,11 @@ fn register_env(port: u16) {
     let Some(env_url) = std::env::var("MAKEFUN_ENV_URL").ok() else {
         return;
     };
+    if env_url.trim().is_empty() {
+        // Set-but-empty: there is nothing to register with. Return at
+        // once instead of retrying a connect to an empty host for ~15 s.
+        return;
+    }
     let env_url = env_url.trim_end_matches('/');
     let host = env_url.trim_start_matches("http://");
     let body = format!("{{\"port\": {port}}}");
@@ -140,5 +152,26 @@ fn route(store: &Arc<RwLock<store::Store>>, token: &str, req: &Request) -> Respo
     } else {
         Response::new(404, b"{\"message\":\"Not Found\"}".to_vec())
             .header("content-type", "application/json; charset=utf-8")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_env_empty_url_returns_fast() {
+        // Set-but-empty MAKEFUN_ENV_URL used to block startup ~15 s
+        // (150 retries x 100 ms against an empty host). It must now
+        // return immediately.
+        std::env::set_var("MAKEFUN_ENV_URL", "");
+        let start = std::time::Instant::now();
+        register_env(1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "register_env took {:?} with an empty URL",
+            start.elapsed()
+        );
+        std::env::remove_var("MAKEFUN_ENV_URL");
     }
 }

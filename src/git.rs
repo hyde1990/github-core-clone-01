@@ -1,5 +1,11 @@
 //! Git objects, packs, pkt-lines and fetch planning. Pure functions over
 //! bytes; the store (store.rs) owns the maps.
+//!
+//! Round 15 hardening (C4): `parse_pack` bounds the declared object count
+//! by the input size *before* allocating, caps the pre-allocation at 1024,
+//! and rejects a declared object size above the 64 MiB inflate cap *before*
+//! inflating it — so a count of 0xFFFFFFFF or a 200 MB declaration can
+//! never trigger a huge allocation or a giant inflate.
 
 use crate::sha1::{hash_object, Sha1};
 use crate::util::{hex_decode_20, hex_encode};
@@ -557,6 +563,13 @@ pub fn plan_fetch(
 
 /// Parse a packfile (v2/3, plain objects only) into (oid, type, bytes).
 /// Verifies the trailer SHA-1.
+///
+/// C4 hardening: the declared object count is bounded by the input size
+/// *before* the trailer check and *before* any allocation (a well-formed
+/// object needs at least ~10 bytes, so `count > (len - 32) / 10` cannot be
+/// real); the result vector pre-allocates at most 1024 entries; and each
+/// object's declared size is checked against the 64 MiB inflate cap
+/// before `inflate_parts` runs.
 pub fn parse_pack(data: &[u8]) -> Result<Vec<(Oid, ObjType, Vec<u8>)>, String> {
     if data.len() < 12 + 20 {
         return Err("pack too short".to_string());
@@ -569,14 +582,21 @@ pub fn parse_pack(data: &[u8]) -> Result<Vec<(Oid, ObjType, Vec<u8>)>, String> {
         return Err(format!("unsupported pack version {version}"));
     }
     let count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    // Trailer check first: cheap and catches truncated/corrupt packs.
+    // Bound the count by the input size first: a count of 0xFFFFFFFF on a
+    // 137-byte pack is rejected here, before the trailer check and before
+    // any allocation could run away.
+    let max_objects = data.len().saturating_sub(32) / 10;
+    if count > max_objects {
+        return Err("pack object count exceeds input size".to_string());
+    }
+    // Trailer check: cheap and catches truncated/corrupt packs.
     let mut trailer_check = Sha1::new();
     trailer_check.update(&data[..data.len() - 20]);
     let want = trailer_check.finish();
     if want != data[data.len() - 20..] {
         return Err("pack trailer checksum mismatch".to_string());
     }
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(1024));
     let mut pos = 12;
     for _ in 0..count {
         if pos >= data.len() - 20 {
@@ -602,6 +622,11 @@ pub fn parse_pack(data: &[u8]) -> Result<Vec<(Oid, ObjType, Vec<u8>)>, String> {
             size |= ((byte & 0x7f) as u64) << shift;
             shift += 7;
             cont = byte & 0x80 != 0;
+        }
+        // The declared size is checked before inflating: a 200 MB
+        // declaration never allocates or inflates.
+        if size > crate::zlib::MAX_INFLATE_BYTES as u64 {
+            return Err("pack object size exceeds limit".to_string());
         }
         let (bytes, consumed) =
             zlib::inflate_parts(&data[pos..]).map_err(|e| format!("zlib: {e}"))?;
@@ -878,5 +903,56 @@ mod tests {
         // Nothing new.
         let plan = plan_fetch(&db, &[c3], &[c3], &[], None);
         assert!(plan.objects.is_empty());
+    }
+
+    #[test]
+    fn rejects_absurd_pack_count() {
+        // A valid small pack with its count field patched to 0xFFFFFFFF:
+        // must fail on the count bound, never on a 206 GB allocation.
+        // (The count check runs before the trailer check, so the stale
+        // trailer does not matter here.)
+        let (b1, t1, d1) = blob(b"hello");
+        let objects = [(b1, Object::new(t1, d1))];
+        let refs: Vec<(Oid, &Object)> = objects.iter().map(|(oid, obj)| (*oid, obj)).collect();
+        let mut pack = build_pack(&refs);
+        pack[8..12].copy_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+        let err = parse_pack(&pack).unwrap_err();
+        assert!(
+            err.contains("exceeds input size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_oversize_declared_object() {
+        // A hand-built pack: count 1, one blob header declaring 200 MB,
+        // a tiny deflate stream, and a correct trailer. The declared size
+        // must be rejected before any inflate happens.
+        let mut pack: Vec<u8> = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // Object header: type blob (3), size 200_000_000, varint-encoded.
+        let mut size: u64 = 200_000_000;
+        let mut first = ((size & 0x0f) as u8) | (3u8 << 4);
+        size >>= 4;
+        if size > 0 {
+            first |= 0x80;
+        }
+        pack.push(first);
+        while size > 0 {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size > 0 {
+                byte |= 0x80;
+            }
+            pack.push(byte);
+        }
+        pack.extend_from_slice(&zlib::deflate(b"tiny"));
+        let mut hasher = Sha1::new();
+        hasher.update(&pack);
+        pack.extend_from_slice(&hasher.finish());
+        let err = parse_pack(&pack).unwrap_err();
+        assert!(err.contains("exceeds limit"), "unexpected error: {err}");
     }
 }

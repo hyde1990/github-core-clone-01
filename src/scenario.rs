@@ -99,6 +99,7 @@ impl Rng {
 
 #[derive(Clone, Debug)]
 pub struct User {
+    #[allow(dead_code)]
     pub id: u32,
     pub login: String,
     pub name: String,

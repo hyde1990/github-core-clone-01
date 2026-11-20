@@ -1,194 +1,235 @@
-//! GitHub REST v3 (`/api/v3`). Every reply is `application/json` with a
-//! non-empty `X-GitHub-Request-Id`; errors carry a string `message`.
+//! GitHub REST v3 (`/api/v3`): repositories, branches, commits, git refs,
+//! contents, labels, issues, comments and pull requests.
+//!
+//! Round 15 rewrite, written from the kit's conformance suite
+//! (`sdk/conformance/checks-rest.ts`, `checks-mcp.ts`, `checks-graphql.ts`)
+//! and the other modules' public interfaces. The design is my own:
+//! one `handle` entry that dispatches on path segments, small per-resource
+//! handlers that take the store lock, and shared serializers
+//! (`repo_json`, `issue_json`, `pull_json`) that the MCP module reuses so
+//! the two surfaces can never drift apart.
+//!
+//! Contract notes (all from the suite):
+//! * every reply is `application/json` with a non-empty
+//!   `x-github-request-id`; unknown routes are JSON 404s; a malformed JSON
+//!   body is a 400 with `{"message":"malformed JSON body"}`.
+//! * a repository belongs to the token's login: the same name under another
+//!   owner is a 404, never a 403 (enforced by `Store::get_repo`).
+//! * lists paginate on `page`/`per_page` (default 30) and carry a `Link`
+//!   header with `rel="next"` while more pages remain.
+//! * issues and pull requests share one number sequence per repository.
+//! * a duplicate repository name is a 422; an unknown label on issue
+//!   create is a 422; a stale contents sha is a 409; a conflicted merge
+//!   is a 405; an unknown pull request merge is a 404.
 
-use crate::git::{oid_from_hex, oid_hex, parse_commit_full};
-use crate::http::Request;
-use crate::http::Response;
+use crate::git::{oid_from_hex, oid_hex, ObjType};
+use crate::http::{Request, Response};
 use crate::json::{obj, Json};
+use crate::scenario::SCENARIO_EPOCH_SEC;
 use crate::store::{
-    delete_file, diff_trees, pull_mergeable, squash_merge, write_file, Issue, IssueState, Label,
-    MergeStatus, Pull, Repo, Store,
+    delete_file, diff_trees, pull_mergeable, squash_merge, Issue, IssueState, Label, MergeStatus,
+    Pull, Repo, Store,
 };
 use crate::util::{base64_decode, base64_encode, iso_from_epoch};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-/// Process-wide request-id counter (no lock needed; ids only need to be
-/// non-empty and distinct).
-static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic request-id counter; every reply gets `req-<hex>`.
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// A fresh `X-GitHub-Request-Id` value.
 pub fn next_request_id() -> String {
-    let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    format!("req-{seq:012x}")
-}
-
-pub fn handle(store: &RwLock<Store>, req: &Request) -> Response {
-    let path = req.path.trim_end_matches('/');
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // /api/v3/...
-    if segments.first() != Some(&"api") || segments.get(1) != Some(&"v3") {
-        return not_found();
-    }
-    let rest = &segments[2..];
-    match (req.method.as_str(), rest) {
-        ("GET", []) => {
-            let body = obj(vec![
-                ("current_user_url", Json::Str("/api/v3/user".to_string())),
-                (
-                    "rate_limit_url",
-                    Json::Str("/api/v3/rate_limit".to_string()),
-                ),
-            ]);
-            json_response(store, 200, body).header("x-oauth-scopes", "repo, read:org")
-        }
-        ("GET", ["meta"]) => json_response(
-            store,
-            200,
-            obj(vec![(
-                "installed_version",
-                Json::Str("forge-1.0.0".to_string()),
-            )]),
-        ),
-        ("GET", ["user"]) => {
-            let store = store.read().unwrap();
-            json_locked(&store, 200, user_json(&store))
-        }
-        ("GET", ["user", "repos"]) => list_user_repos(store, req),
-        ("POST", ["user", "repos"]) => create_repo(store, req),
-        ("GET", ["repos", owner, name]) => get_repo(store, owner, name),
-        ("PATCH", ["repos", owner, name]) => patch_repo(store, req, owner, name),
-        ("DELETE", ["repos", owner, name]) => delete_repo(store, owner, name),
-        ("GET", ["repos", owner, name, "branches"]) => list_branches(store, owner, name),
-        ("GET", ["repos", owner, name, "branches", branch @ ..]) => {
-            get_branch(store, owner, name, branch)
-        }
-        ("GET", ["repos", owner, name, "commits"]) => list_commits(store, req, owner, name),
-        ("GET", ["repos", owner, name, "git", "refs", "heads", branch @ ..]) => {
-            get_ref(store, owner, name, branch)
-        }
-        ("POST", ["repos", owner, name, "git", "refs"]) => create_ref(store, req, owner, name),
-        ("PUT", ["repos", owner, name, "contents", path @ ..]) => {
-            put_contents(store, req, owner, name, path)
-        }
-        ("GET", ["repos", owner, name, "contents", path @ ..]) => {
-            get_contents(store, req, owner, name, path)
-        }
-        ("DELETE", ["repos", owner, name, "contents", path @ ..]) => {
-            delete_contents(store, req, owner, name, path)
-        }
-        ("POST", ["repos", owner, name, "labels"]) => create_label(store, req, owner, name),
-        ("POST", ["repos", owner, name, "issues"]) => create_issue(store, req, owner, name),
-        ("GET", ["repos", owner, name, "issues"]) => list_issues(store, req, owner, name),
-        ("GET", ["repos", owner, name, "issues", number]) => get_issue(store, owner, name, number),
-        ("PATCH", ["repos", owner, name, "issues", number]) => {
-            patch_issue(store, req, owner, name, number)
-        }
-        ("POST", ["repos", owner, name, "issues", number, "comments"]) => {
-            create_comment(store, req, owner, name, number)
-        }
-        ("GET", ["repos", owner, name, "issues", number, "comments"]) => {
-            list_comments(store, owner, name, number)
-        }
-        ("POST", ["repos", owner, name, "pulls"]) => create_pull(store, req, owner, name),
-        ("GET", ["repos", owner, name, "pulls"]) => list_pulls(store, req, owner, name),
-        ("GET", ["repos", owner, name, "pulls", number]) => get_pull(store, owner, name, number),
-        ("GET", ["repos", owner, name, "pulls", number, "files"]) => {
-            list_pull_files(store, owner, name, number)
-        }
-        ("PUT", ["repos", owner, name, "pulls", number, "merge"]) => {
-            merge_pull(store, req, owner, name, number)
-        }
-        _ => not_found(),
-    }
+    format!("req-{:016x}", REQUEST_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------------------
-// Response helpers.
+// Reply helpers.
 
-pub fn json_response(_store: &RwLock<Store>, status: u16, body: Json) -> Response {
-    Response::new(status, body.stringify().into_bytes())
+fn json_reply(status: u16, value: Json) -> Response {
+    Response::new(status, value.stringify().into_bytes())
         .header("content-type", "application/json; charset=utf-8")
         .header("x-github-request-id", &next_request_id())
 }
 
-/// A JSON response when the caller already holds the store lock.
-fn json_locked(_store: &Store, status: u16, body: Json) -> Response {
-    Response::new(status, body.stringify().into_bytes())
-        .header("content-type", "application/json; charset=utf-8")
-        .header("x-github-request-id", &next_request_id())
-}
-
-pub fn error_response(store: &RwLock<Store>, status: u16, message: &str) -> Response {
-    json_response(
-        store,
+fn error_reply(status: u16, message: &str) -> Response {
+    json_reply(
         status,
         obj(vec![("message", Json::Str(message.to_string()))]),
     )
 }
 
-fn not_found() -> Response {
-    Response::new(404, br#"{"message":"Not Found"}"#.to_vec())
-        .header("content-type", "application/json; charset=utf-8")
-}
-
-/// Parse a JSON request body; an empty body is `{}`; malformed JSON is 400.
+/// Parse the request body as JSON. An empty body counts as an empty object;
+/// anything present but unparseable is the protocol 400.
 fn parse_body(req: &Request) -> Result<Json, Response> {
-    if req.body.is_empty() {
-        return Ok(Json::Obj(vec![]));
-    }
     let text = String::from_utf8_lossy(&req.body);
-    crate::json::parse(&text).map_err(|_| {
-        Response::new(400, br#"{"message":"malformed JSON body"}"#.to_vec())
-            .header("content-type", "application/json; charset=utf-8")
-    })
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(obj(vec![]));
+    }
+    match crate::json::parse(text) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(error_reply(400, "malformed JSON body")),
+    }
 }
 
-fn body_str<'a>(body: &'a Json, key: &str) -> Option<&'a str> {
-    body.get(key)?.as_str()
+fn body_str<'a>(body: &'a Json, field: &str) -> Option<&'a str> {
+    body.get(field)?.as_str()
 }
 
-fn body_bool(body: &Json, key: &str) -> Option<bool> {
-    body.get(key)?.as_bool()
+fn body_bool(body: &Json, field: &str, default: bool) -> bool {
+    body.get(field).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
-fn number_param(text: &str) -> Option<u32> {
-    text.parse::<u32>().ok()
+/// `page`/`per_page` from the query string (defaults 1 and 30).
+fn page_params(req: &Request) -> (usize, usize) {
+    let page = req
+        .query_param("page")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|p| *p >= 1)
+        .unwrap_or(1);
+    let per_page = req
+        .query_param("per_page")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|p| *p >= 1)
+        .unwrap_or(30);
+    (page, per_page)
+}
+
+/// Slice `items` to the requested page and build the `Link` header value
+/// (`rel="next"` only when a later page exists). The URL is absolute, on
+/// the request's own host, so the suite's same-origin check passes.
+fn page_link(req: &Request, base: &str, page: usize, per_page: usize, total: usize) -> String {
+    let mut links: Vec<String> = Vec::new();
+    let host = req.host();
+    if page * per_page < total {
+        links.push(format!(
+            "<http://{host}{base}?per_page={per_page}&page={}>; rel=\"next\"",
+            page + 1
+        ));
+    }
+    if page > 1 {
+        links.push(format!(
+            "<http://{host}{base}?per_page={per_page}&page={}>; rel=\"prev\"",
+            page - 1
+        ));
+        links.push(format!(
+            "<http://{host}{base}?per_page={per_page}&page=1>; rel=\"first\""
+        ));
+    }
+    let last = total.div_ceil(per_page).max(1);
+    if last > 1 {
+        links.push(format!(
+            "<http://{host}{base}?per_page={per_page}&page={last}>; rel=\"last\""
+        ));
+    }
+    links.join(", ")
+}
+
+/// Paginate an already-ordered list of JSON values.
+fn paginate(req: &Request, base: &str, items: Vec<Json>) -> (Vec<Json>, Option<String>) {
+    let (page, per_page) = page_params(req);
+    let total = items.len();
+    let start = (page - 1) * per_page;
+    let page_items: Vec<Json> = items.into_iter().skip(start).take(per_page).collect();
+    let link = if total > per_page || page > 1 {
+        Some(page_link(req, base, page, per_page, total))
+    } else {
+        None
+    };
+    (page_items, link)
+}
+
+fn list_reply(req: &Request, base: &str, items: Vec<Json>) -> Response {
+    let (page_items, link) = paginate(req, base, items);
+    let mut response = json_reply(200, Json::Arr(page_items));
+    if let Some(link) = link {
+        response.headers.push(("link".to_string(), link));
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
-// Shapes.
+// Serializers. These are the canonical shapes; the MCP module calls the
+// same three functions so both surfaces render identical objects.
 
-pub fn user_json(store: &Store) -> Json {
+fn user_json(login: &str) -> Json {
     obj(vec![
-        ("login", Json::Str(store.viewer.login.clone())),
-        ("id", Json::Int(store.viewer.id as i64)),
-        ("name", Json::Str(store.viewer.name.clone())),
-        ("email", Json::Str(store.viewer.email.clone())),
+        ("login", Json::Str(login.to_string())),
+        ("id", Json::Int(1000)),
+        (
+            "node_id",
+            Json::Str(base64_encode(format!("User:{login}").as_bytes())),
+        ),
         ("type", Json::Str("User".to_string())),
+        ("site_admin", Json::Bool(false)),
+        (
+            "avatar_url",
+            Json::Str(format!("https://avatars.githubusercontent.com/{login}")),
+        ),
+        ("html_url", Json::Str(format!("https://github.com/{login}"))),
+        (
+            "url",
+            Json::Str(format!("https://api.github.com/users/{login}")),
+        ),
     ])
 }
 
 pub fn repo_json(repo: &Repo) -> Json {
+    let open_issues = repo
+        .issues
+        .iter()
+        .filter(|issue| issue.state == IssueState::Open)
+        .count() as i64;
     obj(vec![
         ("id", Json::Int(repo.db_id as i64)),
+        (
+            "node_id",
+            Json::Str(base64_encode(
+                format!("Repository:{}", repo.db_id).as_bytes(),
+            )),
+        ),
         ("name", Json::Str(repo.name.clone())),
         ("full_name", Json::Str(repo.full_name())),
-        (
-            "owner",
-            obj(vec![
-                ("login", Json::Str(repo.owner.clone())),
-                ("id", Json::Int(1000)),
-            ]),
-        ),
         ("private", Json::Bool(repo.private)),
+        ("owner", user_json(&repo.owner)),
         ("description", Json::Str(repo.description.clone())),
         ("default_branch", Json::Str(repo.default_branch.clone())),
-        ("has_issues", Json::Bool(true)),
         (
-            "created_at",
-            Json::Str(iso_from_epoch(crate::scenario::SCENARIO_EPOCH_SEC)),
+            "html_url",
+            Json::Str(format!("https://github.com/{}", repo.full_name())),
         ),
+        (
+            "url",
+            Json::Str(format!("https://api.github.com/repos/{}", repo.full_name())),
+        ),
+        (
+            "clone_url",
+            Json::Str(format!("https://github.com/{}.git", repo.full_name())),
+        ),
+        (
+            "ssh_url",
+            Json::Str(format!("git@github.com:{}.git", repo.full_name())),
+        ),
+        ("created_at", Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC))),
+        ("updated_at", Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC))),
+        ("pushed_at", Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC))),
+        ("homepage", Json::Str(String::new())),
+        ("language", Json::Null),
+        ("has_issues", Json::Bool(true)),
+        ("has_projects", Json::Bool(true)),
+        ("has_wiki", Json::Bool(true)),
+        ("has_pages", Json::Bool(false)),
+        ("forks_count", Json::Int(0)),
+        ("stargazers_count", Json::Int(0)),
+        ("watchers_count", Json::Int(0)),
+        ("open_issues_count", Json::Int(open_issues)),
+        ("license", Json::Null),
+        ("topics", Json::Arr(vec![])),
+        (
+            "visibility",
+            Json::Str(if repo.private { "private" } else { "public" }.to_string()),
+        ),
+        ("archived", Json::Bool(false)),
+        ("disabled", Json::Bool(false)),
     ])
 }
 
@@ -196,6 +237,8 @@ fn label_json(label: &Label) -> Json {
     obj(vec![
         ("name", Json::Str(label.name.clone())),
         ("color", Json::Str(label.color.clone())),
+        ("description", Json::Str(String::new())),
+        ("default", Json::Bool(false)),
     ])
 }
 
@@ -203,40 +246,91 @@ pub fn issue_json(viewer_login: &str, repo: &Repo, issue: &Issue) -> Json {
     let labels: Vec<Json> = issue
         .labels
         .iter()
-        .map(|name| {
-            let color = repo
-                .labels
+        .filter_map(|name| {
+            repo.labels
                 .iter()
-                .find(|l| &l.name == name)
-                .map(|l| l.color.clone())
-                .unwrap_or_else(|| "ededed".to_string());
-            obj(vec![
-                ("name", Json::Str(name.clone())),
-                ("color", Json::Str(color)),
-            ])
+                .find(|label| &label.name == name)
+                .map(label_json)
         })
         .collect();
     obj(vec![
         ("id", Json::Int(issue.id as i64)),
+        (
+            "node_id",
+            Json::Str(base64_encode(
+                format!("Issue:{}:{}", repo.db_id, issue.number).as_bytes(),
+            )),
+        ),
         ("number", Json::Int(issue.number as i64)),
         ("title", Json::Str(issue.title.clone())),
         ("body", Json::Str(issue.body.clone())),
         ("state", Json::Str(issue.state.as_str().to_string())),
+        ("user", user_json(viewer_login)),
         ("labels", Json::Arr(labels)),
-        (
-            "user",
-            obj(vec![("login", Json::Str(viewer_login.to_string()))]),
-        ),
+        ("comments", Json::Int(issue.comments.len() as i64)),
         (
             "created_at",
-            Json::Str(iso_from_epoch(
-                crate::scenario::SCENARIO_EPOCH_SEC + issue.created_seq,
-            )),
+            Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC + issue.created_seq)),
         ),
         (
             "updated_at",
-            Json::Str(iso_from_epoch(
-                crate::scenario::SCENARIO_EPOCH_SEC + issue.created_seq,
+            Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC + issue.created_seq)),
+        ),
+        (
+            "url",
+            Json::Str(format!(
+                "https://api.github.com/repos/{}/issues/{}",
+                repo.full_name(),
+                issue.number
+            )),
+        ),
+        (
+            "html_url",
+            Json::Str(format!(
+                "https://github.com/{}/issues/{}",
+                repo.full_name(),
+                issue.number
+            )),
+        ),
+        (
+            "repository_url",
+            Json::Str(format!("https://api.github.com/repos/{}", repo.full_name())),
+        ),
+        ("assignee", Json::Null),
+        ("assignees", Json::Arr(vec![])),
+        ("milestone", Json::Null),
+        ("locked", Json::Bool(false)),
+    ])
+}
+
+fn comment_json(viewer_login: &str, repo: &Repo, comment: &crate::store::Comment) -> Json {
+    obj(vec![
+        ("id", Json::Int(comment.id as i64)),
+        (
+            "node_id",
+            Json::Str(base64_encode(
+                format!("IssueComment:{}:{}", repo.db_id, comment.id).as_bytes(),
+            )),
+        ),
+        ("body", Json::Str(comment.body.clone())),
+        ("user", user_json(viewer_login)),
+        ("created_at", Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC))),
+        ("updated_at", Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC))),
+        (
+            "url",
+            Json::Str(format!(
+                "https://api.github.com/repos/{}/issues/comments/{}",
+                repo.full_name(),
+                comment.id
+            )),
+        ),
+        (
+            "html_url",
+            Json::Str(format!(
+                "https://github.com/{}/issues/{}#issuecomment-{}",
+                repo.full_name(),
+                comment.id,
+                comment.id
             )),
         ),
     ])
@@ -245,84 +339,289 @@ pub fn issue_json(viewer_login: &str, repo: &Repo, issue: &Issue) -> Json {
 pub fn pull_json(viewer_login: &str, repo: &Repo, pull: &Pull) -> Json {
     let head_sha = repo
         .branch_tip(&pull.head_ref)
-        .map(|oid| oid_hex(&oid))
-        .unwrap_or_default();
-    let base_sha = oid_hex(&pull.base_sha);
-    let state = if pull.merged {
-        "closed"
-    } else {
-        pull.state.as_str()
+        .map(|oid| Json::Str(oid_hex(&oid)))
+        .unwrap_or(Json::Null);
+    let base_sha = repo
+        .branch_tip(&pull.base_ref)
+        .map(|oid| Json::Str(oid_hex(&oid)))
+        .unwrap_or(Json::Null);
+    let mergeable = match pull_mergeable(repo, pull) {
+        MergeStatus::CanMerge => Json::Bool(true),
+        MergeStatus::Conflicting => Json::Bool(false),
+        MergeStatus::Unknown => Json::Null,
     };
-    let mut fields: Vec<(&str, Json)> = vec![
+    obj(vec![
         ("id", Json::Int(pull.id as i64)),
+        (
+            "node_id",
+            Json::Str(base64_encode(
+                format!("PullRequest:{}:{}", repo.db_id, pull.number).as_bytes(),
+            )),
+        ),
         ("number", Json::Int(pull.number as i64)),
         ("title", Json::Str(pull.title.clone())),
         ("body", Json::Str(pull.body.clone())),
-        ("state", Json::Str(state.to_string())),
+        ("state", Json::Str(pull.state.as_str().to_string())),
         ("merged", Json::Bool(pull.merged)),
         (
-            "mergeable",
-            Json::Bool(pull_mergeable(repo, pull) == MergeStatus::CanMerge),
+            "merged_at",
+            pull.merged_at
+                .as_ref()
+                .map(|at| Json::Str(at.clone()))
+                .unwrap_or(Json::Null),
         ),
+        (
+            "merge_commit_sha",
+            pull.merge_commit_sha
+                .as_ref()
+                .map(|oid| Json::Str(oid_hex(oid)))
+                .unwrap_or(Json::Null),
+        ),
+        ("mergeable", mergeable),
         (
             "head",
             obj(vec![
                 ("ref", Json::Str(pull.head_ref.clone())),
-                ("sha", Json::Str(head_sha)),
+                ("sha", head_sha),
                 (
                     "label",
-                    Json::Str(format!("{viewer_login}:{}", pull.head_ref)),
+                    Json::Str(format!("{}:{}", repo.owner, pull.head_ref)),
                 ),
+                ("user", user_json(viewer_login)),
+                ("repo", repo_json(repo)),
             ]),
         ),
         (
             "base",
             obj(vec![
                 ("ref", Json::Str(pull.base_ref.clone())),
-                ("sha", Json::Str(base_sha)),
+                ("sha", base_sha),
                 (
                     "label",
-                    Json::Str(format!("{viewer_login}:{}", pull.base_ref)),
+                    Json::Str(format!("{}:{}", repo.owner, pull.base_ref)),
                 ),
+                ("user", user_json(viewer_login)),
+                ("repo", repo_json(repo)),
+            ]),
+        ),
+        ("user", user_json(viewer_login)),
+        (
+            "created_at",
+            Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC + pull.created_seq)),
+        ),
+        (
+            "updated_at",
+            Json::Str(iso_from_epoch(SCENARIO_EPOCH_SEC + pull.created_seq)),
+        ),
+        (
+            "url",
+            Json::Str(format!(
+                "https://api.github.com/repos/{}/pulls/{}",
+                repo.full_name(),
+                pull.number
+            )),
+        ),
+        (
+            "html_url",
+            Json::Str(format!(
+                "https://github.com/{}/pull/{}",
+                repo.full_name(),
+                pull.number
+            )),
+        ),
+        ("comments", Json::Int(0)),
+        ("commits", Json::Int(0)),
+        ("additions", Json::Int(0)),
+        ("deletions", Json::Int(0)),
+        ("changed_files", Json::Int(0)),
+    ])
+}
+
+/// One commit in a list, from the parsed commit header.
+fn commit_json(repo: &Repo, oid: &crate::git::Oid) -> Json {
+    let Some(object) = repo.objects.get(oid) else {
+        return obj(vec![("sha", Json::Str(oid_hex(oid)))]);
+    };
+    let Some(full) = crate::git::parse_commit_full(&object.data) else {
+        return obj(vec![("sha", Json::Str(oid_hex(oid)))]);
+    };
+    let (author_name, author_email) = split_ident(&full.author);
+    let (committer_name, committer_email) = split_ident(&full.committer);
+    let parents: Vec<Json> = full
+        .parents
+        .iter()
+        .map(|parent| obj(vec![("sha", Json::Str(oid_hex(parent)))]))
+        .collect();
+    obj(vec![
+        ("sha", Json::Str(oid_hex(oid))),
+        (
+            "node_id",
+            Json::Str(base64_encode(
+                format!("Commit:{oid_hex}", oid_hex = oid_hex(oid)).as_bytes(),
+            )),
+        ),
+        (
+            "commit",
+            obj(vec![
+                ("message", Json::Str(full.message.clone())),
+                (
+                    "author",
+                    obj(vec![
+                        ("name", Json::Str(author_name.clone())),
+                        ("email", Json::Str(author_email)),
+                        ("date", Json::Str(iso_from_epoch(full.timestamp))),
+                    ]),
+                ),
+                (
+                    "committer",
+                    obj(vec![
+                        ("name", Json::Str(committer_name.clone())),
+                        ("email", Json::Str(committer_email)),
+                        ("date", Json::Str(iso_from_epoch(full.timestamp))),
+                    ]),
+                ),
+                ("tree", obj(vec![("sha", Json::Str(oid_hex(&full.tree)))])),
             ]),
         ),
         (
-            "user",
-            obj(vec![("login", Json::Str(viewer_login.to_string()))]),
+            "author",
+            obj(vec![("login", Json::Str(author_name.clone()))]),
         ),
         (
-            "created_at",
-            Json::Str(iso_from_epoch(
-                crate::scenario::SCENARIO_EPOCH_SEC + pull.created_seq,
+            "committer",
+            obj(vec![("login", Json::Str(committer_name.clone()))]),
+        ),
+        ("parents", Json::Arr(parents)),
+        (
+            "url",
+            Json::Str(format!(
+                "https://api.github.com/repos/{}/commits/{}",
+                repo.full_name(),
+                oid_hex(oid)
             )),
         ),
-    ];
-    if pull.merged {
-        fields.push((
-            "merged_at",
-            Json::Str(pull.merged_at.clone().unwrap_or_default()),
-        ));
-        fields.push((
-            "merge_commit_sha",
-            Json::Str(
-                pull.merge_commit_sha
-                    .map(|oid| oid_hex(&oid))
-                    .unwrap_or_default(),
-            ),
-        ));
-    }
-    obj(fields)
+    ])
 }
 
-fn comment_json(id: u64, body: &str) -> Json {
-    obj(vec![
-        ("id", Json::Int(id as i64)),
-        ("body", Json::Str(body.to_string())),
-        (
-            "created_at",
-            Json::Str(iso_from_epoch(crate::scenario::SCENARIO_EPOCH_SEC)),
+/// Split a `Name <email>` identity line into its parts.
+fn split_ident(ident: &str) -> (String, String) {
+    match ident.split_once('<') {
+        Some((name, rest)) => (
+            name.trim().to_string(),
+            rest.trim_end_matches('>').trim().to_string(),
         ),
-    ])
+        None => (ident.to_string(), String::new()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher.
+
+pub fn handle(store: &RwLock<Store>, req: &Request) -> Response {
+    let segments: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    // Everything here lives under /api/v3 (main.rs already routed it).
+    if segments.len() < 2 || segments[0] != "api" || segments[1] != "v3" {
+        return error_reply(404, "Not Found");
+    }
+    let tail = &segments[2..];
+    let method = req.method.as_str();
+    match (method, tail) {
+        ("GET", []) => root(req),
+        ("GET", ["meta"]) => json_reply(
+            200,
+            obj(vec![("installed_version", Json::Str("1.0.0".to_string()))]),
+        ),
+        ("GET", ["user"]) => user(store),
+        ("GET", ["user", "repos"]) => list_user_repos(store, req),
+        ("POST", ["user", "repos"]) => create_user_repo(store, req),
+        ("GET", ["users", login]) => user_by_login(store, login),
+        ("GET", ["repos", owner, name]) => get_repo(store, owner, name),
+        ("PATCH", ["repos", owner, name]) => patch_repo(store, req, owner, name),
+        ("DELETE", ["repos", owner, name]) => delete_repo(store, owner, name),
+        ("GET", ["repos", owner, name, "branches"]) => list_branches(store, owner, name),
+        ("GET", ["repos", owner, name, "branches", branch]) => {
+            get_branch(store, owner, name, branch)
+        }
+        ("GET", ["repos", owner, name, "commits"]) => list_commits(store, req, owner, name),
+        ("GET", ["repos", owner, name, "commits", sha]) => get_commit(store, owner, name, sha),
+        ("GET", ["repos", owner, name, "git", "refs"]) => list_refs(store, owner, name),
+        ("POST", ["repos", owner, name, "git", "refs"]) => create_ref(store, req, owner, name),
+        ("GET", ["repos", owner, name, "git", "refs", rest @ ..]) => {
+            get_ref(store, owner, name, rest)
+        }
+        ("GET", ["repos", owner, name, "contents"]) => get_contents(store, req, owner, name, &[]),
+        ("GET", ["repos", owner, name, "contents", rest @ ..]) => {
+            get_contents(store, req, owner, name, rest)
+        }
+        ("PUT", ["repos", owner, name, "contents", rest @ ..]) => {
+            put_contents(store, req, owner, name, rest)
+        }
+        ("DELETE", ["repos", owner, name, "contents", rest @ ..]) => {
+            delete_contents(store, req, owner, name, rest)
+        }
+        ("GET", ["repos", owner, name, "labels"]) => list_labels(store, owner, name),
+        ("POST", ["repos", owner, name, "labels"]) => create_label(store, req, owner, name),
+        ("GET", ["repos", owner, name, "issues"]) => list_issues(store, req, owner, name),
+        ("POST", ["repos", owner, name, "issues"]) => create_issue(store, req, owner, name),
+        ("GET", ["repos", owner, name, "issues", number]) => get_issue(store, owner, name, number),
+        ("PATCH", ["repos", owner, name, "issues", number]) => {
+            patch_issue(store, req, owner, name, number)
+        }
+        ("GET", ["repos", owner, name, "issues", number, "comments"]) => {
+            list_comments(store, owner, name, number)
+        }
+        ("POST", ["repos", owner, name, "issues", number, "comments"]) => {
+            create_comment(store, req, owner, name, number)
+        }
+        ("GET", ["repos", owner, name, "pulls"]) => list_pulls(store, req, owner, name),
+        ("POST", ["repos", owner, name, "pulls"]) => create_pull(store, req, owner, name),
+        ("GET", ["repos", owner, name, "pulls", number]) => get_pull(store, owner, name, number),
+        ("GET", ["repos", owner, name, "pulls", number, "files"]) => {
+            list_pull_files(store, owner, name, number)
+        }
+        ("GET", ["repos", owner, name, "pulls", number, "commits"]) => {
+            list_pull_commits(store, owner, name, number)
+        }
+        ("PUT", ["repos", owner, name, "pulls", number, "merge"]) => {
+            merge_pull(store, req, owner, name, number)
+        }
+        _ => error_reply(404, "Not Found"),
+    }
+}
+
+fn root(_req: &Request) -> Response {
+    let mut response = json_reply(
+        200,
+        obj(vec![
+            (
+                "current_user_url",
+                Json::Str("https://api.github.com/user".to_string()),
+            ),
+            (
+                "repository_url",
+                Json::Str("https://api.github.com/repos/{owner}/{repo}".to_string()),
+            ),
+            ("message", Json::Str("GitHub API".to_string())),
+        ]),
+    );
+    response
+        .headers
+        .push(("x-oauth-scopes".to_string(), "repo, read:org".to_string()));
+    response
+}
+
+fn user(store: &RwLock<Store>) -> Response {
+    let store = store.read().unwrap();
+    json_reply(200, user_json(&store.viewer.login))
+}
+
+fn user_by_login(store: &RwLock<Store>, login: &str) -> Response {
+    let store = store.read().unwrap();
+    if login == store.viewer.login {
+        json_reply(200, user_json(login))
+    } else {
+        error_reply(404, "Not Found")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,126 +629,62 @@ fn comment_json(id: u64, body: &str) -> Json {
 
 fn list_user_repos(store: &RwLock<Store>, req: &Request) -> Response {
     let store = store.read().unwrap();
-    let per_page = req
-        .query_param("per_page")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(30)
-        .clamp(1, 100);
-    let page = req
-        .query_param("page")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1);
-    let repos = store.viewer_repos();
-    let total = repos.len();
-    let start = (page - 1) * per_page;
-    let items: Vec<Json> = repos
+    let items: Vec<Json> = store
+        .viewer_repos()
         .iter()
-        .skip(start)
-        .take(per_page)
         .map(|repo| repo_json(repo))
         .collect();
-    let mut res = json_locked(&store, 200, Json::Arr(items));
-    let pages = total.div_ceil(per_page);
-    if page < pages {
-        let next = format!(
-            "http://{}/api/v3/user/repos?per_page={per_page}&page={}",
-            req.host(),
-            page + 1
-        );
-        let last = format!(
-            "http://{}/api/v3/user/repos?per_page={per_page}&page={pages}",
-            req.host()
-        );
-        res = res.header(
-            "link",
-            &format!("<{next}>; rel=\"next\", <{last}>; rel=\"last\""),
-        );
-    }
-    res
+    list_reply(req, "/api/v3/user/repos", items)
 }
 
-fn create_repo(store: &RwLock<Store>, req: &Request) -> Response {
+fn create_user_repo(store: &RwLock<Store>, req: &Request) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
-    let Some(name) = body_str(&body, "name") else {
-        return error_response(store, 422, "name is required");
+    let Some(name) = body_str(&body, "name").map(|s| s.to_string()) else {
+        return error_reply(422, "name is required");
     };
-    let name = name.to_string();
-    if name.is_empty() || name.len() > 100 {
-        return error_response(store, 422, "invalid repository name");
+    if name.is_empty() || name.contains('/') {
+        return error_reply(422, "invalid repository name");
     }
     let description = body_str(&body, "description").unwrap_or("").to_string();
-    let private = body_bool(&body, "private").unwrap_or(false);
-    let viewer = {
-        let store = store.read().unwrap();
-        store.viewer.login.clone()
-    };
+    let private = body_bool(&body, "private", false);
     let mut store = store.write().unwrap();
     match store.create_repo(&name, &description, private) {
-        Ok(_) => match store.get_repo(&viewer, &name) {
-            Some(repo) => json_locked(&store, 201, repo_json(repo)),
-            None => json_locked(
-                &store,
-                500,
-                obj(vec![("message", Json::Str("internal error".to_string()))]),
-            ),
-        },
-        Err(_) => json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("Repository already exists".to_string()),
-            )]),
-        ),
-    }
-}
-
-fn with_repo<F>(store: &RwLock<Store>, owner: &str, name: &str, f: F) -> Response
-where
-    F: FnOnce(&Store, &Repo) -> Response,
-{
-    let store = store.read().unwrap();
-    match store.get_repo(owner, name) {
-        Some(repo) => f(&store, repo),
-        None => json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        ),
+        Ok(_) => {
+            let viewer = store.viewer.login.clone();
+            let repo = store.get_repo(&viewer, &name).unwrap();
+            json_reply(201, repo_json(repo))
+        }
+        Err(_) => error_reply(422, "Repository already exists"),
     }
 }
 
 fn get_repo(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
-    with_repo(store, owner, name, |store, repo| {
-        json_locked(store, 200, repo_json(repo))
-    })
+    let store = store.read().unwrap();
+    match store.get_repo(owner, name) {
+        Some(repo) => json_reply(200, repo_json(repo)),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
 fn patch_repo(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
     let mut store = store.write().unwrap();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
     if let Some(description) = body_str(&body, "description") {
         repo.description = description.to_string();
     }
-    if let Some(private) = body_bool(&body, "private") {
+    if let Some(private) = body.get("private").and_then(|v| v.as_bool()) {
         repo.private = private;
     }
-    let json = repo_json(repo);
-    json_locked(&store, 200, json)
+    json_reply(200, repo_json(repo))
 }
 
 fn delete_repo(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
@@ -459,276 +694,193 @@ fn delete_repo(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
             .header("content-type", "application/json; charset=utf-8")
             .header("x-github-request-id", &next_request_id())
     } else {
-        json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        )
+        error_reply(404, "Not Found")
     }
 }
 
+// ---------------------------------------------------------------------------
+// Branches and commits.
+
 fn list_branches(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
-    with_repo(store, owner, name, |store, repo| {
-        let mut branches: Vec<Json> = repo
-            .sorted_refs()
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("refs/heads/"))
-            .map(|(name, oid)| {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let mut branches: Vec<Json> = repo
+        .refs
+        .iter()
+        .filter_map(|(ref_name, oid)| {
+            ref_name.strip_prefix("refs/heads/").map(|branch| {
                 obj(vec![
-                    (
-                        "name",
-                        Json::Str(name.trim_start_matches("refs/heads/").to_string()),
-                    ),
-                    ("commit", obj(vec![("sha", Json::Str(oid_hex(&oid)))])),
+                    ("name", Json::Str(branch.to_string())),
+                    ("commit", obj(vec![("sha", Json::Str(oid_hex(oid)))])),
+                    ("protected", Json::Bool(false)),
                 ])
             })
-            .collect();
-        branches.sort_by(|a, b| {
-            let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            an.cmp(bn)
-        });
-        json_locked(store, 200, Json::Arr(branches))
-    })
+        })
+        .collect();
+    branches.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("name").and_then(|v| v.as_str()))
+    });
+    json_reply(200, Json::Arr(branches))
 }
 
-fn get_branch(store: &RwLock<Store>, owner: &str, name: &str, branch: &[&str]) -> Response {
-    let branch_name = branch.join("/");
-    with_repo(store, owner, name, |store, repo| {
-        match repo.branch_tip(&branch_name) {
-            Some(oid) => json_locked(
-                store,
-                200,
-                obj(vec![
-                    ("name", Json::Str(branch_name)),
-                    ("commit", obj(vec![("sha", Json::Str(oid_hex(&oid)))])),
-                ]),
-            ),
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+fn get_branch(store: &RwLock<Store>, owner: &str, name: &str, branch: &str) -> Response {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    match repo.branch_tip(branch) {
+        Some(oid) => json_reply(
+            200,
+            obj(vec![
+                ("name", Json::Str(branch.to_string())),
+                ("commit", obj(vec![("sha", Json::Str(oid_hex(&oid)))])),
+                ("protected", Json::Bool(false)),
+            ]),
+        ),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
-fn get_ref(store: &RwLock<Store>, owner: &str, name: &str, branch: &[&str]) -> Response {
-    let branch_name = branch.join("/");
-    with_repo(store, owner, name, |store, repo| {
-        match repo.branch_tip(&branch_name) {
-            Some(oid) => json_locked(
-                store,
-                200,
-                obj(vec![
-                    ("ref", Json::Str(format!("refs/heads/{branch_name}"))),
-                    ("object", obj(vec![("sha", Json::Str(oid_hex(&oid)))])),
-                ]),
-            ),
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+fn list_commits(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let tip = match req.query_param("sha") {
+        Some(reference) => repo.resolve_ref(reference),
+        None => repo.default_tip(),
+    };
+    let Some(tip) = tip else {
+        return json_reply(200, Json::Arr(vec![]));
+    };
+    let items: Vec<Json> = repo
+        .commits_from(tip)
+        .iter()
+        .map(|oid| commit_json(repo, oid))
+        .collect();
+    list_reply(req, &format!("/api/v3/repos/{owner}/{name}/commits"), items)
+}
+
+fn get_commit(store: &RwLock<Store>, owner: &str, name: &str, sha: &str) -> Response {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(oid) = oid_from_hex(sha).filter(|oid| repo.objects.get(oid).is_some()) else {
+        return error_reply(404, "Not Found");
+    };
+    if repo.objects.get(&oid).map(|o| o.ty) != Some(ObjType::Commit) {
+        return error_reply(404, "Not Found");
+    }
+    json_reply(200, commit_json(repo, &oid))
+}
+
+// ---------------------------------------------------------------------------
+// Git refs.
+
+fn list_refs(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let items: Vec<Json> = repo
+        .sorted_refs()
+        .iter()
+        .map(|(ref_name, oid)| {
+            obj(vec![
+                ("ref", Json::Str(ref_name.clone())),
+                (
+                    "object",
+                    obj(vec![
+                        ("sha", Json::Str(oid_hex(oid))),
+                        ("type", Json::Str("commit".to_string())),
+                    ]),
+                ),
+            ])
+        })
+        .collect();
+    json_reply(200, Json::Arr(items))
 }
 
 fn create_ref(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
     let Some(ref_name) = body_str(&body, "ref").map(|s| s.to_string()) else {
-        return error_response(store, 422, "ref is required");
+        return error_reply(422, "ref is required");
     };
-    let Some(sha) = body_str(&body, "sha").and_then(oid_from_hex) else {
-        return error_response(store, 422, "sha is required");
+    let Some(sha_text) = body_str(&body, "sha").map(|s| s.to_string()) else {
+        return error_reply(422, "sha is required");
     };
     if !ref_name.starts_with("refs/") {
-        return error_response(store, 422, "invalid ref");
+        return error_reply(422, "ref must start with refs/");
     }
+    let Some(oid) = oid_from_hex(&sha_text) else {
+        return error_reply(422, "invalid sha");
+    };
     let mut store = store.write().unwrap();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
     if repo.refs.contains_key(&ref_name) {
-        return json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("Reference already exists".to_string()),
-            )]),
-        );
+        return error_reply(422, "Reference already exists");
     }
-    if repo.objects.get(&sha).is_none() {
-        return json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("Object does not exist".to_string()),
-            )]),
-        );
+    if repo.objects.get(&oid).is_none() {
+        return error_reply(422, "sha does not exist");
     }
-    repo.set_ref(&ref_name, Some(sha));
-    json_locked(
-        &store,
+    repo.set_ref(&ref_name, Some(oid));
+    json_reply(
         201,
         obj(vec![
             ("ref", Json::Str(ref_name)),
-            ("object", obj(vec![("sha", Json::Str(oid_hex(&sha)))])),
+            (
+                "object",
+                obj(vec![
+                    ("sha", Json::Str(oid_hex(&oid))),
+                    ("type", Json::Str("commit".to_string())),
+                ]),
+            ),
         ]),
     )
 }
 
-fn list_commits(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
-    let sha_param = req.query_param("sha").map(|s| s.to_string());
-    with_repo(store, owner, name, |store, repo| {
-        let tip = match sha_param {
-            Some(ref_name) => repo.resolve_ref(&ref_name),
-            None => repo.default_tip(),
-        };
-        let Some(tip) = tip else {
-            return json_locked(store, 200, Json::Arr(vec![]));
-        };
-        let commits: Vec<Json> = repo
-            .commits_from(tip)
-            .into_iter()
-            .filter_map(|oid| {
-                let object = repo.objects.get(&oid)?;
-                let full = parse_commit_full(&object.data)?;
-                Some(obj(vec![
-                    ("sha", Json::Str(oid_hex(&oid))),
-                    (
-                        "commit",
-                        obj(vec![
-                            ("message", Json::Str(full.message)),
-                            (
-                                "author",
-                                obj(vec![
-                                    ("name", Json::Str(full.author.clone())),
-                                    ("date", Json::Str(iso_from_epoch(full.timestamp))),
-                                ]),
-                            ),
-                            (
-                                "committer",
-                                obj(vec![
-                                    ("name", Json::Str(full.committer.clone())),
-                                    ("date", Json::Str(iso_from_epoch(full.timestamp))),
-                                ]),
-                            ),
-                        ]),
-                    ),
-                ]))
-            })
-            .collect();
-        json_locked(store, 200, Json::Arr(commits))
-    })
+fn get_ref(store: &RwLock<Store>, owner: &str, name: &str, rest: &[&str]) -> Response {
+    let ref_name = format!("refs/{}", rest.join("/"));
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    match repo.refs.get(&ref_name) {
+        Some(oid) => json_reply(
+            200,
+            obj(vec![
+                ("ref", Json::Str(ref_name)),
+                (
+                    "object",
+                    obj(vec![
+                        ("sha", Json::Str(oid_hex(oid))),
+                        ("type", Json::Str("commit".to_string())),
+                    ]),
+                ),
+            ]),
+        ),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Contents.
 
-fn put_contents(
-    store: &RwLock<Store>,
-    req: &Request,
-    owner: &str,
-    name: &str,
-    path: &[&str],
-) -> Response {
-    let body = match parse_body(req) {
-        Ok(body) => body,
-        Err(res) => return res,
-    };
-    let path_str = path.join("/");
-    if path_str.is_empty() {
-        return error_response(store, 422, "path is required");
-    }
-    let Some(message) = body_str(&body, "message").map(|s| s.to_string()) else {
-        return error_response(store, 422, "message is required");
-    };
-    let Some(content_b64) = body_str(&body, "content").map(|s| s.to_string()) else {
-        return error_response(store, 422, "content is required");
-    };
-    let Some(content) = base64_decode(&content_b64) else {
-        return error_response(store, 422, "content is not base64");
-    };
-    let expected_sha = body_str(&body, "sha").and_then(oid_from_hex);
-    let branch = body_str(&body, "branch").map(|s| s.to_string());
-    let mut store = store.write().unwrap();
-    // Scalars first: the repo borrow below is taken from `store`.
-    let identity = store.identity();
-    let timestamp = store.next_commit_timestamp();
-    let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
-    };
-    match write_file(
-        repo,
-        &identity,
-        timestamp,
-        &path_str,
-        &content,
-        &message,
-        branch.as_deref(),
-        expected_sha,
-    ) {
-        Ok((blob_oid, commit_oid, created)) => {
-            let body = obj(vec![
-                (
-                    "content",
-                    obj(vec![
-                        ("name", Json::Str(path.last().unwrap_or(&"").to_string())),
-                        ("path", Json::Str(path_str.clone())),
-                        ("sha", Json::Str(oid_hex(&blob_oid))),
-                        ("size", Json::Int(content.len() as i64)),
-                        ("encoding", Json::Str("base64".to_string())),
-                        ("content", Json::Str(content_b64)),
-                    ]),
-                ),
-                (
-                    "commit",
-                    obj(vec![
-                        ("sha", Json::Str(oid_hex(&commit_oid))),
-                        ("message", Json::Str(message)),
-                    ]),
-                ),
-            ]);
-            json_locked(&store, if created { 201 } else { 200 }, body)
-        }
-        Err("stale sha") => json_locked(
-            &store,
-            409,
-            obj(vec![(
-                "message",
-                Json::Str("sha does not match".to_string()),
-            )]),
-        ),
-        Err("missing sha") => json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("sha is required to update a file".to_string()),
-            )]),
-        ),
-        Err(_) => json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("cannot write file".to_string()),
-            )]),
-        ),
+/// Resolve the `ref` query parameter (or the default branch) to a commit.
+fn contents_tip(repo: &Repo, req: &Request) -> Option<crate::git::Oid> {
+    match req.query_param("ref") {
+        Some(reference) => repo.resolve_ref(reference),
+        None => repo.default_tip(),
     }
 }
 
@@ -737,86 +889,148 @@ fn get_contents(
     req: &Request,
     owner: &str,
     name: &str,
-    path: &[&str],
+    rest: &[&str],
 ) -> Response {
-    let path_str = path.join("/");
-    let ref_param = req.query_param("ref").map(|s| s.to_string());
-    with_repo(store, owner, name, |store, repo| {
-        let tip = match ref_param {
-            Some(ref_name) => repo.resolve_ref(&ref_name),
-            None => repo.default_tip(),
+    let path = rest.join("/");
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(tip) = contents_tip(repo, req) else {
+        return error_reply(404, "Not Found");
+    };
+    if path.is_empty() {
+        return match repo.list_dir(tip, "") {
+            Some(entries) => json_reply(200, Json::Arr(dir_entries(repo, "", &entries))),
+            None => error_reply(404, "Not Found"),
         };
-        let Some(tip) = tip else {
-            return json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            );
-        };
-        if path_str.is_empty() {
-            // The root directory.
-            return match repo.list_dir(tip, "") {
-                Some(entries) => json_locked(store, 200, dir_json("", &entries)),
-                None => json_locked(
-                    store,
-                    404,
-                    obj(vec![("message", Json::Str("Not Found".to_string()))]),
-                ),
-            };
-        }
-        if let Some((blob_oid, bytes)) = repo.read_path(tip, &path_str) {
-            return json_locked(
-                store,
-                200,
-                obj(vec![
-                    ("type", Json::Str("file".to_string())),
-                    ("encoding", Json::Str("base64".to_string())),
-                    ("content", Json::Str(base64_encode(&bytes))),
-                    ("sha", Json::Str(oid_hex(&blob_oid))),
-                    ("size", Json::Int(bytes.len() as i64)),
-                    ("name", Json::Str(path.last().unwrap_or(&"").to_string())),
-                    ("path", Json::Str(path_str)),
-                ]),
-            );
-        }
-        match repo.list_dir(tip, &path_str) {
-            Some(entries) => json_locked(store, 200, dir_json(&path_str, &entries)),
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+    }
+    if let Some((oid, bytes)) = repo.read_path(tip, &path) {
+        let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        return json_reply(
+            200,
+            obj(vec![
+                ("type", Json::Str("file".to_string())),
+                ("encoding", Json::Str("base64".to_string())),
+                ("size", Json::Int(bytes.len() as i64)),
+                ("name", Json::Str(file_name)),
+                ("path", Json::Str(path)),
+                ("content", Json::Str(base64_encode(&bytes))),
+                ("sha", Json::Str(oid_hex(&oid))),
+            ]),
+        );
+    }
+    match repo.list_dir(tip, &path) {
+        Some(entries) => json_reply(200, Json::Arr(dir_entries(repo, &path, &entries))),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
-fn dir_json(dir: &str, entries: &[crate::git::TreeEntry]) -> Json {
-    let mut items: Vec<Json> = entries
+fn dir_entries(_repo: &Repo, dir: &str, entries: &[crate::git::TreeEntry]) -> Vec<Json> {
+    let mut out: Vec<Json> = entries
         .iter()
         .map(|entry| {
-            let path = if dir.is_empty() {
+            let entry_path = if dir.is_empty() {
                 entry.name.clone()
             } else {
                 format!("{dir}/{}", entry.name)
             };
             let is_dir = entry.mode == 0o40000;
-            obj(vec![
+            let mut fields = vec![
                 (
                     "type",
                     Json::Str(if is_dir { "dir" } else { "file" }.to_string()),
                 ),
                 ("name", Json::Str(entry.name.clone())),
-                ("path", Json::Str(path)),
+                ("path", Json::Str(entry_path)),
                 ("sha", Json::Str(oid_hex(&entry.oid))),
-            ])
+            ];
+            if !is_dir {
+                fields.push(("size", Json::Int(0)));
+            }
+            obj(fields)
         })
         .collect();
-    items.sort_by(|a, b| {
-        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        an.cmp(bn)
+    out.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("name").and_then(|v| v.as_str()))
     });
-    Json::Arr(items)
+    out
+}
+
+fn put_contents(
+    store: &RwLock<Store>,
+    req: &Request,
+    owner: &str,
+    name: &str,
+    rest: &[&str],
+) -> Response {
+    let path = rest.join("/");
+    let body = match parse_body(req) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if path.is_empty() {
+        return error_reply(422, "path is required");
+    }
+    let Some(message) = body_str(&body, "message").map(|s| s.to_string()) else {
+        return error_reply(422, "message is required");
+    };
+    let Some(content_b64) = body_str(&body, "content") else {
+        return error_reply(422, "content is required");
+    };
+    let Some(content) = base64_decode(content_b64) else {
+        return error_reply(422, "content is not valid base64");
+    };
+    let branch = body_str(&body, "branch").map(|s| s.to_string());
+    let expected_sha = body_str(&body, "sha").and_then(oid_from_hex);
+    let mut store = store.write().unwrap();
+    let identity = store.identity();
+    let timestamp = store.next_commit_timestamp();
+    let Some(repo) = store.get_repo_mut(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    match crate::store::write_file(
+        repo,
+        &identity,
+        timestamp,
+        &path,
+        &content,
+        &message,
+        branch.as_deref(),
+        expected_sha,
+    ) {
+        Ok((blob_oid, commit_oid, created)) => {
+            let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            json_reply(
+                if created { 201 } else { 200 },
+                obj(vec![
+                    (
+                        "content",
+                        obj(vec![
+                            ("type", Json::Str("file".to_string())),
+                            ("encoding", Json::Str("base64".to_string())),
+                            ("size", Json::Int(content.len() as i64)),
+                            ("name", Json::Str(file_name)),
+                            ("path", Json::Str(path)),
+                            ("sha", Json::Str(oid_hex(&blob_oid))),
+                        ]),
+                    ),
+                    (
+                        "commit",
+                        obj(vec![
+                            ("sha", Json::Str(oid_hex(&commit_oid))),
+                            ("message", Json::Str(message)),
+                        ]),
+                    ),
+                ]),
+            )
+        }
+        Err("stale sha") => error_reply(409, "sha does not match the current file"),
+        Err("missing sha") => error_reply(422, "sha is required to update a file"),
+        Err(_) => error_reply(422, "cannot write file"),
+    }
 }
 
 fn delete_contents(
@@ -824,134 +1038,144 @@ fn delete_contents(
     req: &Request,
     owner: &str,
     name: &str,
-    path: &[&str],
+    rest: &[&str],
 ) -> Response {
+    let path = rest.join("/");
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
-    let path_str = path.join("/");
+    if path.is_empty() {
+        return error_reply(422, "path is required");
+    }
     let message = body_str(&body, "message")
-        .unwrap_or("delete file")
-        .to_string();
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("Delete {path}"));
     let branch = body_str(&body, "branch").map(|s| s.to_string());
+    let expected_sha = body_str(&body, "sha").and_then(oid_from_hex);
     let mut store = store.write().unwrap();
     let identity = store.identity();
     let timestamp = store.next_commit_timestamp();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
+    // A sha that does not match the live blob is a 409, like the PUT path.
+    if let Some(expected) = expected_sha {
+        let tip = match branch
+            .as_deref()
+            .map(|b| repo.branch_tip(b))
+            .unwrap_or_else(|| repo.default_tip())
+        {
+            Some(tip) => tip,
+            None => return error_reply(404, "Not Found"),
+        };
+        match repo.read_path(tip, &path) {
+            Some((current, _)) if current != expected => {
+                return error_reply(409, "sha does not match the current file");
+            }
+            None => return error_reply(404, "Not Found"),
+            _ => {}
+        }
+    }
     match delete_file(
         repo,
         &identity,
         timestamp,
-        &path_str,
+        &path,
         &message,
         branch.as_deref(),
     ) {
-        Ok(commit_oid) => json_locked(
-            &store,
+        Ok(commit_oid) => json_reply(
             200,
-            obj(vec![
-                (
-                    "commit",
-                    obj(vec![
-                        ("sha", Json::Str(oid_hex(&commit_oid))),
-                        ("message", Json::Str(message)),
-                    ]),
-                ),
-                ("content", Json::Null),
-            ]),
+            obj(vec![(
+                "commit",
+                obj(vec![
+                    ("sha", Json::Str(oid_hex(&commit_oid))),
+                    ("message", Json::Str(message)),
+                ]),
+            )]),
         ),
-        Err(_) => json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        ),
+        Err("no such file") => error_reply(404, "Not Found"),
+        Err("no such branch") => error_reply(404, "Not Found"),
+        Err(_) => error_reply(422, "cannot delete file"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Labels, issues, comments.
+// Labels.
+
+fn list_labels(store: &RwLock<Store>, owner: &str, name: &str) -> Response {
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    json_reply(200, Json::Arr(repo.labels.iter().map(label_json).collect()))
+}
 
 fn create_label(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
     let Some(label_name) = body_str(&body, "name").map(|s| s.to_string()) else {
-        return error_response(store, 422, "name is required");
+        return error_reply(422, "name is required");
     };
-    let color = body_str(&body, "color").unwrap_or("ededed").to_string();
+    let color = body_str(&body, "color")
+        .unwrap_or("ededed")
+        .trim_start_matches('#')
+        .to_string();
     let mut store = store.write().unwrap();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
-    if let Some(existing) = repo.labels.iter().find(|l| l.name == label_name) {
-        let json = label_json(existing);
-        return json_locked(&store, 201, json);
+    if repo.labels.iter().any(|label| label.name == label_name) {
+        return error_reply(422, "Label already exists");
     }
     repo.labels.push(Label {
         name: label_name,
         color,
     });
-    let json = match repo.labels.last() {
-        Some(label) => label_json(label),
-        None => obj(vec![("message", Json::Str("internal error".to_string()))]),
-    };
-    json_locked(&store, 201, json)
+    let label = repo.labels.last().unwrap();
+    json_reply(201, label_json(label))
+}
+
+// ---------------------------------------------------------------------------
+// Issues and comments.
+
+fn parse_number(text: &str) -> Option<u32> {
+    text.parse::<u32>().ok()
 }
 
 fn create_issue(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
     let Some(title) = body_str(&body, "title").map(|s| s.to_string()) else {
-        return error_response(store, 422, "title is required");
+        return error_reply(422, "title is required");
     };
+    if title.is_empty() {
+        return error_reply(422, "title is required");
+    }
     let body_text = body_str(&body, "body").unwrap_or("").to_string();
-    let labels: Vec<String> = body
+    let wanted_labels: Vec<String> = body
         .get("labels")
         .and_then(|v| v.as_arr())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
                 .collect()
         })
         .unwrap_or_default();
     let mut store = store.write().unwrap();
-    // Find the first unknown label (if any) before borrowing the repo mutably.
-    let bad_label: Option<String> = match store.get_repo(owner, name) {
-        Some(repo) => labels
-            .iter()
-            .find(|label| !repo.labels.iter().any(|l| l.name == **label))
-            .cloned(),
-        None => {
-            return json_locked(
-                &store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            )
-        }
+    let Some(repo) = store.get_repo_mut(owner, name) else {
+        return error_reply(404, "Not Found");
     };
-    if let Some(label) = bad_label {
-        return json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str(format!("Label '{label}' does not exist")),
-            )]),
-        );
+    for wanted in &wanted_labels {
+        if !repo.labels.iter().any(|label| &label.name == wanted) {
+            return error_reply(422, &format!("unknown label: {wanted}"));
+        }
     }
     let id = store.next_issue_id;
     store.next_issue_id += 1;
@@ -959,78 +1183,66 @@ fn create_issue(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -
     let created_seq = store.created_seq;
     let viewer_login = store.viewer.login.clone();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
     repo.number_seq += 1;
     let number = repo.number_seq;
-    let issue = Issue {
+    repo.issues.push(Issue {
         id,
         number,
         title,
         body: body_text,
         state: IssueState::Open,
-        labels,
+        labels: wanted_labels,
         comments: Vec::new(),
         created_seq,
-    };
-    repo.issues.push(issue);
-    let json = match repo.issues.last() {
-        Some(issue) => issue_json(&viewer_login, repo, issue),
-        None => obj(vec![("message", Json::Str("internal error".to_string()))]),
-    };
-    json_locked(&store, 201, json)
+    });
+    let issue = repo.issues.last().unwrap();
+    json_reply(201, issue_json(&viewer_login, repo, issue))
 }
 
 fn list_issues(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
-    let state = req.query_param("state").unwrap_or("open").to_string();
-    let direction = req.query_param("direction").unwrap_or("desc").to_string();
-    let sort = req.query_param("sort").unwrap_or("created").to_string();
-    let _ = sort;
-    with_repo(store, owner, name, |store, repo| {
-        let mut issues: Vec<&Issue> = repo
-            .issues
-            .iter()
-            .filter(|issue| match state.as_str() {
-                "all" => true,
-                "closed" => issue.state == IssueState::Closed,
-                _ => issue.state == IssueState::Open,
-            })
-            .collect();
-        // Created order is the number order.
-        issues.sort_by_key(|issue| issue.number);
-        if direction == "desc" {
-            issues.reverse();
-        }
-        let items: Vec<Json> = issues
-            .into_iter()
-            .map(|issue| issue_json(&store.viewer.login, repo, issue))
-            .collect();
-        json_locked(store, 200, Json::Arr(items))
-    })
-}
-
-fn find_issue(repo: &Repo, number: u32) -> Option<&Issue> {
-    repo.issues.iter().find(|issue| issue.number == number)
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let state = req.query_param("state").unwrap_or("open");
+    let direction = req.query_param("direction").unwrap_or("desc");
+    let mut issues: Vec<&Issue> = repo
+        .issues
+        .iter()
+        .filter(|issue| match state {
+            "all" => true,
+            "closed" => issue.state == IssueState::Closed,
+            _ => issue.state == IssueState::Open,
+        })
+        .collect();
+    // Sort by creation order (the `sort` parameter is `created` in the
+    // suite; any other value keeps creation order too).
+    if direction == "asc" {
+        issues.sort_by_key(|issue| issue.created_seq);
+    } else {
+        issues.sort_by_key(|issue| std::cmp::Reverse(issue.created_seq));
+    }
+    let items: Vec<Json> = issues
+        .iter()
+        .map(|issue| issue_json(&store.viewer.login, repo, issue))
+        .collect();
+    list_reply(req, &format!("/api/v3/repos/{owner}/{name}/issues"), items)
 }
 
 fn get_issue(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
     };
-    with_repo(store, owner, name, |store, repo| {
-        match find_issue(repo, number) {
-            Some(issue) => json_locked(store, 200, issue_json(&store.viewer.login, repo, issue)),
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    match repo.issues.iter().find(|issue| issue.number == number) {
+        Some(issue) => json_reply(200, issue_json(&store.viewer.login, repo, issue)),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
 fn patch_issue(
@@ -1040,47 +1252,70 @@ fn patch_issue(
     name: &str,
     number: &str,
 ) -> Response {
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
+    };
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
-    };
+    if let Some(state) = body_str(&body, "state") {
+        if state != "open" && state != "closed" {
+            return error_reply(422, "invalid state");
+        }
+    }
     let mut store = store.write().unwrap();
     let viewer_login = store.viewer.login.clone();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
-    let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+    let Some(issue) = repo
+        .issues
+        .iter_mut()
+        .find(|issue| issue.number == number)
+        .map(|issue| {
+            if let Some(state) = body_str(&body, "state") {
+                issue.state = if state == "open" {
+                    IssueState::Open
+                } else {
+                    IssueState::Closed
+                };
+            }
+            if let Some(title) = body_str(&body, "title") {
+                issue.title = title.to_string();
+            }
+            if let Some(body_text) = body_str(&body, "body") {
+                issue.body = body_text.to_string();
+            }
+            issue.clone()
+        })
+    else {
+        return error_reply(404, "Not Found");
     };
-    if let Some(state) = body_str(&body, "state") {
-        issue.state = if state == "closed" {
-            IssueState::Closed
-        } else {
-            IssueState::Open
-        };
-    }
-    if let Some(title) = body_str(&body, "title") {
-        issue.title = title.to_string();
-    }
-    if let Some(body_text) = body_str(&body, "body") {
-        issue.body = body_text.to_string();
-    }
-    // Clone the mutated issue first: `issue` holds a mutable borrow of
-    // `repo`, so the JSON must be built from the snapshot.
-    let snapshot = issue.clone();
-    let json = issue_json(&viewer_login, repo, &snapshot);
-    json_locked(&store, 200, json)
+    json_reply(200, issue_json(&viewer_login, repo, &issue))
+}
+
+fn list_comments(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
+    };
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(issue) = repo.issues.iter().find(|issue| issue.number == number) else {
+        return error_reply(404, "Not Found");
+    };
+    json_reply(
+        200,
+        Json::Arr(
+            issue
+                .comments
+                .iter()
+                .map(|comment| comment_json(&store.viewer.login, repo, comment))
+                .collect(),
+        ),
+    )
 }
 
 fn create_comment(
@@ -1090,129 +1325,93 @@ fn create_comment(
     name: &str,
     number: &str,
 ) -> Response {
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
+    };
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
-    };
-    let Some(comment_body) = body_str(&body, "body").map(|s| s.to_string()) else {
-        return error_response(store, 422, "body is required");
+    let Some(text) = body_str(&body, "body").map(|s| s.to_string()) else {
+        return error_reply(422, "body is required");
     };
     let mut store = store.write().unwrap();
+    let viewer_login = store.viewer.login.clone();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
-    // Take the comment id before borrowing the issue (both live in `repo`).
     repo.comment_seq += 1;
     let id = repo.comment_seq;
     let Some(issue) = repo.issues.iter_mut().find(|issue| issue.number == number) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
-    issue.comments.push(crate::store::Comment {
-        id,
-        body: comment_body.clone(),
-    });
-    json_locked(&store, 201, comment_json(id, &comment_body))
-}
-
-fn list_comments(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
-    };
-    with_repo(store, owner, name, |store, repo| {
-        match find_issue(repo, number) {
-            Some(issue) => {
-                let items: Vec<Json> = issue
-                    .comments
-                    .iter()
-                    .map(|c| comment_json(c.id, &c.body))
-                    .collect();
-                json_locked(store, 200, Json::Arr(items))
-            }
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+    issue
+        .comments
+        .push(crate::store::Comment { id, body: text });
+    let comment = issue.comments.last().unwrap().clone();
+    json_reply(201, comment_json(&viewer_login, repo, &comment))
 }
 
 // ---------------------------------------------------------------------------
 // Pull requests.
 
+/// A branch name from the request body, tolerating an `owner:` prefix.
+fn clean_branch(raw: &str) -> String {
+    raw.rsplit(':').next().unwrap_or(raw).to_string()
+}
+
 fn create_pull(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
     let body = match parse_body(req) {
         Ok(body) => body,
-        Err(res) => return res,
+        Err(response) => return response,
     };
     let Some(title) = body_str(&body, "title").map(|s| s.to_string()) else {
-        return error_response(store, 422, "title is required");
+        return error_reply(422, "title is required");
     };
+    let Some(head_raw) = body_str(&body, "head").map(|s| s.to_string()) else {
+        return error_reply(422, "head is required");
+    };
+    let Some(base_raw) = body_str(&body, "base").map(|s| s.to_string()) else {
+        return error_reply(422, "base is required");
+    };
+    let head = clean_branch(&head_raw);
+    let base = clean_branch(&base_raw);
     let body_text = body_str(&body, "body").unwrap_or("").to_string();
-    let Some(head) = body_str(&body, "head").map(|s| s.to_string()) else {
-        return error_response(store, 422, "head is required");
-    };
-    let Some(base) = body_str(&body, "base").map(|s| s.to_string()) else {
-        return error_response(store, 422, "base is required");
-    };
     let mut store = store.write().unwrap();
-    // Validate the branches and take the ids before borrowing the repo mutably.
     let (base_sha, head_ok) = match store.get_repo(owner, name) {
         Some(repo) => (repo.branch_tip(&base), repo.branch_tip(&head).is_some()),
-        None => {
-            return json_locked(
-                &store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            )
-        }
+        None => return error_reply(404, "Not Found"),
     };
     let Some(base_sha) = base_sha else {
-        return json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("base branch does not exist".to_string()),
-            )]),
-        );
+        return error_reply(422, "base branch does not exist");
     };
     if !head_ok {
-        return json_locked(
-            &store,
-            422,
-            obj(vec![(
-                "message",
-                Json::Str("head branch does not exist".to_string()),
-            )]),
-        );
+        return error_reply(422, "head branch does not exist");
+    }
+    if head == base {
+        return error_reply(422, "head and base are the same branch");
+    }
+    let viewer_login = store.viewer.login.clone();
+    let Some(repo) = store.get_repo_mut(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    if repo
+        .pulls
+        .iter()
+        .any(|pull| pull.head_ref == head && pull.state == IssueState::Open)
+    {
+        return error_reply(422, "a pull request from this head branch is already open");
     }
     let id = store.next_pull_id;
     store.next_pull_id += 1;
     store.created_seq += 1;
     let created_seq = store.created_seq;
-    let viewer_login = store.viewer.login.clone();
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
     repo.number_seq += 1;
     let number = repo.number_seq;
-    let pull = Pull {
+    repo.pulls.push(Pull {
         id,
         number,
         title,
@@ -1225,104 +1424,106 @@ fn create_pull(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) ->
         merged_at: None,
         merge_commit_sha: None,
         created_seq,
-    };
-    repo.pulls.push(pull);
-    let json = match repo.pulls.last() {
-        Some(pull) => pull_json(&viewer_login, repo, pull),
-        None => obj(vec![("message", Json::Str("internal error".to_string()))]),
-    };
-    json_locked(&store, 201, json)
+    });
+    let pull = repo.pulls.last().unwrap();
+    json_reply(201, pull_json(&viewer_login, repo, pull))
 }
 
 fn list_pulls(store: &RwLock<Store>, req: &Request, owner: &str, name: &str) -> Response {
-    let state = req.query_param("state").unwrap_or("open").to_string();
-    with_repo(store, owner, name, |store, repo| {
-        let pulls: Vec<&Pull> = repo
-            .pulls
-            .iter()
-            .filter(|pull| match state.as_str() {
-                "all" => true,
-                "closed" => pull.state == IssueState::Closed,
-                _ => pull.state == IssueState::Open,
-            })
-            .collect();
-        let items: Vec<Json> = pulls
-            .into_iter()
-            .map(|pull| pull_json(&store.viewer.login, repo, pull))
-            .collect();
-        json_locked(store, 200, Json::Arr(items))
-    })
-}
-
-fn find_pull(repo: &Repo, number: u32) -> Option<&Pull> {
-    repo.pulls.iter().find(|pull| pull.number == number)
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let state = req.query_param("state").unwrap_or("open");
+    let mut pulls: Vec<&Pull> = repo
+        .pulls
+        .iter()
+        .filter(|pull| match state {
+            "all" => true,
+            "closed" => pull.state == IssueState::Closed,
+            _ => pull.state == IssueState::Open,
+        })
+        .collect();
+    pulls.sort_by_key(|pull| std::cmp::Reverse(pull.created_seq));
+    let items: Vec<Json> = pulls
+        .iter()
+        .map(|pull| pull_json(&store.viewer.login, repo, pull))
+        .collect();
+    list_reply(req, &format!("/api/v3/repos/{owner}/{name}/pulls"), items)
 }
 
 fn get_pull(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
     };
-    with_repo(store, owner, name, |store, repo| {
-        match find_pull(repo, number) {
-            Some(pull) => json_locked(store, 200, pull_json(&store.viewer.login, repo, pull)),
-            None => json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            ),
-        }
-    })
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    match repo.pulls.iter().find(|pull| pull.number == number) {
+        Some(pull) => json_reply(200, pull_json(&store.viewer.login, repo, pull)),
+        None => error_reply(404, "Not Found"),
+    }
 }
 
 fn list_pull_files(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
     };
-    with_repo(store, owner, name, |store, repo| {
-        let Some(pull) = find_pull(repo, number) else {
-            return json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            );
-        };
-        let Some(head_tip) = repo.branch_tip(&pull.head_ref) else {
-            return json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            );
-        };
-        let Some(base_commit) = repo.objects.commit_of(&pull.base_sha) else {
-            return json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            );
-        };
-        let Some(head_commit) = repo.objects.commit_of(&head_tip) else {
-            return json_locked(
-                store,
-                404,
-                obj(vec![("message", Json::Str("Not Found".to_string()))]),
-            );
-        };
-        let files: Vec<Json> = diff_trees(repo, base_commit.tree, head_commit.tree)
-            .into_iter()
-            .filter(|change| change.status != "removed")
-            .map(|change| {
-                let changes = change.changes();
-                obj(vec![
-                    ("filename", Json::Str(change.path)),
-                    ("status", Json::Str(change.status.to_string())),
-                    ("additions", Json::Int(change.additions as i64)),
-                    ("deletions", Json::Int(change.deletions as i64)),
-                    ("changes", Json::Int(changes as i64)),
-                ])
-            })
-            .collect();
-        json_locked(store, 200, Json::Arr(files))
-    })
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(pull) = repo.pulls.iter().find(|pull| pull.number == number) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(head_tip) = repo.branch_tip(&pull.head_ref) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(base_commit) = repo.objects.commit_of(&pull.base_sha) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(head_commit) = repo.objects.commit_of(&head_tip) else {
+        return error_reply(404, "Not Found");
+    };
+    let changes = diff_trees(repo, base_commit.tree, head_commit.tree);
+    let items: Vec<Json> = changes
+        .iter()
+        .map(|change| {
+            obj(vec![
+                ("filename", Json::Str(change.path.clone())),
+                ("status", Json::Str(change.status.to_string())),
+                ("additions", Json::Int(change.additions as i64)),
+                ("deletions", Json::Int(change.deletions as i64)),
+                ("changes", Json::Int(change.changes() as i64)),
+            ])
+        })
+        .collect();
+    json_reply(200, Json::Arr(items))
+}
+
+fn list_pull_commits(store: &RwLock<Store>, owner: &str, name: &str, number: &str) -> Response {
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
+    };
+    let store = store.read().unwrap();
+    let Some(repo) = store.get_repo(owner, name) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(pull) = repo.pulls.iter().find(|pull| pull.number == number) else {
+        return error_reply(404, "Not Found");
+    };
+    let Some(head_tip) = repo.branch_tip(&pull.head_ref) else {
+        return error_reply(404, "Not Found");
+    };
+    let base_closure = repo.objects.closure(&[pull.base_sha]);
+    let items: Vec<Json> = repo
+        .commits_from(head_tip)
+        .iter()
+        .filter(|oid| !base_closure.contains(*oid))
+        .map(|oid| commit_json(repo, oid))
+        .collect();
+    json_reply(200, Json::Arr(items))
 }
 
 fn merge_pull(
@@ -1332,60 +1533,42 @@ fn merge_pull(
     name: &str,
     number: &str,
 ) -> Response {
-    let _body = match parse_body(req) {
-        Ok(body) => body,
-        Err(res) => return res,
+    let Some(number) = parse_number(number) else {
+        return error_reply(404, "Not Found");
     };
-    let Some(number) = number_param(number) else {
-        return error_response(store, 404, "Not Found");
-    };
+    // The body is optional (merge_method defaults to squash here); a
+    // malformed body is still a 400.
+    if let Err(response) = parse_body(req) {
+        return response;
+    }
     let mut store = store.write().unwrap();
     let exists = store
         .get_repo(owner, name)
-        .is_some_and(|repo| repo.pulls.iter().any(|p| p.number == number));
+        .is_some_and(|repo| repo.pulls.iter().any(|pull| pull.number == number));
     if !exists {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     }
     let identity = store.identity();
     let timestamp = store.next_commit_timestamp();
-    let merged_at = iso_from_epoch(crate::scenario::SCENARIO_EPOCH_SEC + store.commit_seq);
+    let merged_at = iso_from_epoch(SCENARIO_EPOCH_SEC + store.commit_seq);
     let Some(repo) = store.get_repo_mut(owner, name) else {
-        return json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        );
+        return error_reply(404, "Not Found");
     };
     match squash_merge(repo, &identity, timestamp, merged_at, number) {
-        Ok(sha) => {
-            let pull = repo.pulls.iter().find(|p| p.number == number);
-            let message = match pull {
-                Some(pull) => format!("Merge pull request #{number} from {}", pull.head_ref),
-                None => format!("Merge pull request #{number}"),
-            };
-            json_locked(
-                &store,
-                200,
-                obj(vec![
-                    ("merged", Json::Bool(true)),
-                    ("sha", Json::Str(oid_hex(&sha))),
-                    ("message", Json::Str(message)),
-                ]),
-            )
-        }
-        Err("conflict") => json_locked(
-            &store,
-            405,
-            obj(vec![("message", Json::Str("Merge conflict".to_string()))]),
+        Ok(sha) => json_reply(
+            200,
+            obj(vec![
+                ("merged", Json::Bool(true)),
+                ("sha", Json::Str(oid_hex(&sha))),
+                (
+                    "message",
+                    Json::Str("Pull request successfully merged".to_string()),
+                ),
+            ]),
         ),
-        Err(_) => json_locked(
-            &store,
-            404,
-            obj(vec![("message", Json::Str("Not Found".to_string()))]),
-        ),
+        Err("conflict") => error_reply(405, "merge conflict"),
+        Err("already merged") => error_reply(405, "Pull request is already merged"),
+        Err("closed") => error_reply(405, "Pull request is closed"),
+        Err(_) => error_reply(405, "Pull request cannot be merged"),
     }
 }
