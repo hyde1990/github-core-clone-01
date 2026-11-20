@@ -1,71 +1,32 @@
-// main.ts — entrypoint for the github-core-clone-01 forge.
-//
-// Lifecycle (per RULES.txt):
-//   1. bind an ephemeral port (port 0, never a fixed one);
-//   2. POST {"port": N} to $MAKEFUN_ENV_URL/register so the suite can reach us;
-//   3. poll GET $MAKEFUN_ENV_URL/done until it answers {"done": true}, then exit 0.
-// The process is one Node process serving git smart HTTP, REST v3, GraphQL and
-// MCP from a single in-memory store. When MAKEFUN_ENV_URL is unset (local
-// development) the server simply keeps serving on an ephemeral port and prints it.
+// Thin launcher: the Rust binary does all the work. Node never sits on
+// a hot path — it only spawns ./forge beside this file, mirrors its exit
+// code, and passes the harness environment through.
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-import { createApp } from './src/app.ts';
+const dir = dirname(fileURLToPath(import.meta.url));
+const binary = join(dir, "forge");
 
-const envUrl = process.env.MAKEFUN_ENV_URL ?? '';
+const child = spawn(binary, [], {
+  stdio: "inherit",
+  env: {
+    ...process.env,
+    // Pass the harness environment through unchanged.
+    MAKEFUN_ENV_URL: process.env.MAKEFUN_ENV_URL ?? "",
+    MAKEFUN_SHOP_TOKEN: process.env.MAKEFUN_SHOP_TOKEN ?? "",
+  },
+});
 
-async function postJson(url: string, payload: unknown): Promise<unknown> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const text = await response.text();
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
-}
+child.on("error", (error) => {
+  console.error(`forge: failed to start ${binary}: ${error.message}`);
+  process.exit(1);
+});
 
-async function waitForDone(): Promise<void> {
-  for (;;) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    try {
-      const response = await fetch(`${envUrl}/done`);
-      const payload = (await response.json()) as { done?: boolean };
-      if (payload.done === true) return;
-    } catch {
-      // The env is not up yet; keep polling.
-    }
-  }
-}
-
-async function run(): Promise<void> {
-  const server = createApp();
-  const port = await new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('could not bind an ephemeral port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-
-  if (envUrl === '') {
-    // Local run: no harness to register with. Keep serving.
-    process.stdout.write(`github-core-clone listening on 127.0.0.1:${port}\n`);
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
     return;
   }
-
-  await postJson(`${envUrl}/register`, { port });
-  await waitForDone();
-  server.close();
-  process.exit(0);
-}
-
-run().catch((err: unknown) => {
-  process.stderr.write(`fatal: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
+  process.exit(code ?? 0);
 });

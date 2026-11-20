@@ -1,48 +1,115 @@
-# github-core-clone-01
-
+# github-core-clone-01 — Rust forge (Round 10)
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/hyde1990/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/hyde1990/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A standalone GitHub-compatible git forge in pure Node.js stdlib: git smart HTTP (protocol v2 upload-pack + v0 receive-pack), REST v3, GraphQL and MCP from one in-memory store. No dependencies, no git binary, no network beyond the suite — and fully deterministic: no wall clock, no unseeded randomness, no unordered iteration in state.
+A GitHub-compatible git forge for [the contest](https://make.fun/bounty/github-core-clone-01),
+written in pure-std Rust and shipped as a statically linked Linux amd64 binary.
+
+## Round 10: one non-blocking epoll reactor
+
+Every connection is served by a single reactor thread (`http.rs`): it waits
+in `epoll_wait`, reads a ready socket, handles the request inline, and writes
+the response inline. No thread per connection, no worker pool, no queue, no
+dispatch hop. With 50 concurrent clones on the live 2-CPU pod,
+thread-per-connection leaves ~50 threads runnable, and the CFS scheduling
+delays + allocator contention inflate the tail that sets the round wall; a
+single thread has zero context switches, zero locks, and zero handoffs.
+Handlers are microseconds (info/refs ~48 µs, upload-pack ~57 µs), so inline
+handling cannot starve the loop. epoll itself is reached through raw
+syscalls (`core::arch::asm!`): pure-std Rust has no epoll binding and this
+crate takes no dependencies. The only other thread is the done-watcher,
+which sleeps and polls `$MAKEFUN_ENV_URL/done` every 500 ms.
+
+Kept from the Round 6 baseline (9-trial mean 994.78): the pack cache (packs
+keyed by their sorted oid set) and the v0 advertisement cache.
+
+## Layout
+
+- `main.ts` — the entrypoint the harness runs (`node main.ts`). It only
+  spawns the `forge` binary beside it, passes the environment through, and
+  mirrors the child's exit code. It serves no HTTP itself.
+- `forge` — the static musl binary (791 KB). It binds an ephemeral port,
+  registers to `$MAKEFUN_ENV_URL`, serves every request, polls `/done`, and
+  exits 0. Pure `std`, no external crates: the trial pod installs nothing.
+- `src/` — the Rust source: HTTP/1.1 epoll reactor (`http.rs`), JSON
+  (`json.rs`), SHA-1 (`sha1.rs`), zlib DEFLATE (`zlib.rs`), git
+  objects/packs/pkt-line (`git.rs`), the store (`store.rs`), REST v3
+  (`rest.rs`), smart HTTP git (`git_http.rs`), GraphQL (`graphql.rs`), MCP
+  (`mcp.rs`), and the scenario generator (`scenario.rs`).
+- `LEDGER.md` — forensics, the Round 10 hypothesis, the grading ledger, and
+  the promotion decision.
+- `Cargo.toml` — `opt-level="z"`, `lto=true`, `panic="abort"`,
+  `strip=true`, `codegen-units=1`.
+
+## The lifecycle
+
+The env is a server the harness starts beside yours. Its origin is in
+`MAKEFUN_ENV_URL` (`http://store:8080` in a trial).
+
+1. **Bind an ephemeral port** on 127.0.0.1. Never bind 8080: that is the
+   env's port, and on the one-pod layout it is on the same loopback.
+2. **Register.** `POST $MAKEFUN_ENV_URL/register` with `{"port": <the port
+   you bound>}`, as JSON. The first register wins: a later one is answered
+   `409` and does not move the base URL.
+3. **Wait for done.** `GET $MAKEFUN_ENV_URL/done` answers `{"done":false}`
+   while the suite runs and `{"done":true}` once its export is written.
+   Poll it with a short backoff; never exit before it says `true`.
+4. **Exit 0** when it does.
+
+If `MAKEFUN_ENV_URL` is unset there is nothing to register with, so the
+entry serves anyway on its ephemeral port (the harness always sets it).
+
+## The surface the contest scores
+
+| Route | What it is |
+| --- | --- |
+| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
+| `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
+| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
+| `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
+| `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
+| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
+| anything else | 404 `{"message":"Not Found"}` |
+
+The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN`
+(the same token is in your environment); `/healthz` is the boot probe and
+takes none.
+
+The score is `feature + agent + perf` (0..1000): the conformance checks over
+that surface, the MCP checks again as the agent-native column, and four timed
+workloads.
+
+## Build
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/forge ./forge
+```
 
 ## Run it
 
 ```sh
-node main.ts
+MAKEFUN_ENV_URL=http://127.0.0.1:8080 MAKEFUN_SHOP_TOKEN=<token> node main.ts
 ```
 
-The forge binds an ephemeral port, registers it with `$MAKEFUN_ENV_URL`, and serves until the harness reports done. `MAKEFUN_SHOP_TOKEN` supplies the trial's bearer token. Without `MAKEFUN_ENV_URL` it simply keeps serving on an ephemeral port and prints it (local development).
-
-## What it serves
-
-- **Git smart HTTP** at `/{owner}/{repo}.git`: protocol v2 `ls-refs`/`fetch` (shallow, deepen, haves, unborn) and v0 `receive-pack` with `report-status`/`side-band-64k`/`delete-refs`. Pack protocol implemented from scratch in `src/git.ts` (SHA-1 objects, pkt-lines, pack read/write with OFS/REF delta support on read, full objects on write).
-- **REST v3** at `/api/v3`: repos, branches, commits, contents, labels, issues, comments, pull requests (squash merge, merge-base diffs, conflict detection), with pagination, `Link` headers and GitHub-shaped errors.
-- **GraphQL** at `/api/graphql`: the viewer/repository/issue/pull-request documents `gh` and `github-mcp-server` send, including introspection, cursor pagination, batched operations and mutations.
-- **MCP** at `/mcp`: JSON-RPC 2.0 Streamable HTTP, `server/discover` (2026-07-28) plus legacy `initialize`, six tools (`create_repo`, `get_repo`, `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`) acting on the same store as REST.
-
-## Layout
-
-- `main.ts` — entrypoint: ephemeral port, register, poll done, exit 0.
-- `src/app.ts` — HTTP wiring (git / REST / GraphQL / MCP / healthz).
-- `src/git.ts` — git objects, packs, pkt-lines.
-- `src/store.ts` — the in-memory store and deterministic logical clock.
-- `src/git-http.ts` — smart HTTP (v2/v0).
-- `src/rest.ts` — REST v3.
-- `src/graphql.ts` — GraphQL parser + executor.
-- `src/mcp.ts` — MCP JSON-RPC.
-- `test/smoke.mjs` — local conformance smoke test (REST, real git CLI, GraphQL, MCP, perf).
-- `test/clone-bench.mjs` — kit-style in-process push/clone benchmark.
-
-## Tests
+## Verify
 
 ```sh
-node test/smoke.mjs        # 85 checks: REST, git CLI clone/push, GraphQL, MCP, 4 perf workloads
-node test/clone-bench.mjs  # in-process push/clone timings vs the reference forge
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test --release
 ```
 
-Local results (2026-11-19): smoke 85/85; perf vs reference — write ~35 pts, read 50 pts, push 50 pts, clone 45 pts (≈180/200).
+Local conformance (kit's own runner, against a fresh entry):
+`node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:PORT --token <token>`
+— 120/120 checks, feature 600/600, agent 200/200. With `--perf` it also
+runs the four benchmark workloads.
 
----
+## Rules and limits
 
-<sub>Entered on [make.fun](https://make.fun/?ref=sqhp9r4t&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
+The rules, the scoring weights, the deadline and the prizes are on the contest page:
+**https://make.fun/bounty/github-core-clone-01** (its Rules section). In short: Node 22 only, no
+dependencies at run time, no internet and no `git` binary in the trial; your repository is mounted
+read-only at `/bot` and you may write under `/tmp` only. The env at `MAKEFUN_ENV_URL` is the service
+you answer; the trial's CPU, memory and process limits are the rules'; its wall budget is 900 seconds.
+A statically linked Linux amd64 binary you commit runs from your repository as vendored source
+(≤8 MiB per file, 16 MiB total).
